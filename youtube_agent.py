@@ -207,9 +207,12 @@ INTENTS DISPONIBILI:
    Params: question (la domanda di approfondimento)
    Esempi: "approfondisci il punto sugli MCP servers", "dimmi di più sul secondo video", "cosa intendeva Chase con..."
 
-6. scheduling — L'utente vuole impostare un aggiornamento ricorrente.
-   Params: creator (nome), frequency ("daily", "weekly", "monthly"), day (opzionale: "monday", etc.), keywords (opzionale)
-   Esempi: "aggiornami ogni lunedì sui video di Chase", "briefing settimanale su Cole Medin ogni venerdì"
+6. scheduling — L'utente vuole programmare un invio di video, sia one-shot che ricorrente.
+   Params: creator (nome), n (numero video, default 3), frequency ("once", "daily", "weekly", "monthly"),
+           schedule_time (orario HH:MM, default "08:00"), schedule_date (data YYYY-MM-DD per invii one-shot, opzionale),
+           day (opzionale: "monday", etc. per ricorrenti), keywords (opzionale), topic (opzionale, per ricerche per tema)
+   Esempi: "mandami gli ultimi 3 video di enkk domani alle 8", "aggiornami ogni lunedì sui video di Chase",
+           "programmami un briefing su Cole Medin per domani mattina", "ogni venerdì mandami i video su AI agents"
 
 7. news_search — L'utente vuole le novità su un topic senza specificare un creator.
    Params: topic (argomento), period ("today", "week", "month", default "week"), n (max video, default 5)
@@ -1177,43 +1180,179 @@ def handle_follow_up_intent(params: dict, sender: str):
             send_whatsapp_audio(sender, audio_path)
 
 
+def _execute_scheduled_task(task: dict):
+    """Execute a scheduled task when its timer fires."""
+    sender = task["recipient"]
+    task_type = task.get("type", "channel")  # "channel" or "topic"
+    creator_name = task.get("creator", "")
+    topic = task.get("topic", "")
+    n = task.get("n", 3)
+    keywords = task.get("keywords", [])
+    task_id = task.get("id", "?")
+
+    print(f"\n⏰ Scheduled task {task_id} firing!")
+    print(f"   Type: {task_type}, Creator: {creator_name}, Topic: {topic}, n: {n}")
+
+    try:
+        if task_type == "channel" and creator_name:
+            # Channel analysis
+            channel_url = resolve_creator(creator_name)
+            if not channel_url:
+                send_whatsapp_text(sender, f"⚠️ Task programmato: non trovo il canale di {creator_name}")
+                return
+            videos = get_channel_videos(channel_url, max_results=n)
+            if keywords:
+                videos = [v for v in videos if any(k.lower() in (v.title + v.description).lower() for k in keywords)]
+            if not videos:
+                send_whatsapp_text(sender, f"⚠️ Task programmato: nessun video trovato per {creator_name}")
+                return
+            label = slugify(creator_name)
+            send_whatsapp_text(sender, f"⏰ *Task programmato in esecuzione!*\nAnalizzo {len(videos)} video di {creator_name}...")
+            process_videos(videos, label=label, creator=creator_name, sender=sender)
+
+        elif task_type == "topic" and topic:
+            # Topic search
+            period = task.get("period", "week")
+            date_after = period_to_dateafter(period)
+            videos = search_youtube(topic, max_results=n, upload_date=date_after, period=period)
+            if not videos:
+                send_whatsapp_text(sender, f"⚠️ Task programmato: nessun video trovato su \"{topic}\"")
+                return
+            label = f"news-{slugify(topic)}"
+            send_whatsapp_text(sender, f"⏰ *Task programmato in esecuzione!*\nAnalizzo {len(videos)} video su \"{topic}\"...")
+            process_videos(videos, label=label, creator=label, sender=sender)
+
+        else:
+            send_whatsapp_text(sender, f"⚠️ Task programmato {task_id}: configurazione non valida")
+
+        # Handle recurring tasks — reschedule
+        frequency = task.get("frequency", "once")
+        if frequency != "once":
+            _reschedule_recurring(task)
+
+    except Exception as e:
+        print(f"  ❌ Scheduled task error: {e}")
+        traceback.print_exc()
+        send_whatsapp_text(sender, f"❌ Errore nel task programmato: {str(e)[:200]}")
+
+
+def _reschedule_recurring(task: dict):
+    """Reschedule a recurring task for next occurrence."""
+    frequency = task.get("frequency", "weekly")
+    schedule_time = task.get("schedule_time", "08:00")
+
+    now = datetime.now()
+    h, m = map(int, schedule_time.split(":"))
+
+    if frequency == "daily":
+        next_run = (now + timedelta(days=1)).replace(hour=h, minute=m, second=0, microsecond=0)
+    elif frequency == "weekly":
+        next_run = (now + timedelta(days=7)).replace(hour=h, minute=m, second=0, microsecond=0)
+    elif frequency == "monthly":
+        next_run = (now + timedelta(days=30)).replace(hour=h, minute=m, second=0, microsecond=0)
+    else:
+        return
+
+    delay = (next_run - now).total_seconds()
+    if delay > 0:
+        timer = threading.Timer(delay, _execute_scheduled_task, args=[task])
+        timer.daemon = True
+        timer.start()
+        print(f"  📅 Recurring task rescheduled: next run at {next_run.strftime('%Y-%m-%d %H:%M')}")
+
+
 def handle_scheduling(params: dict, sender: str):
-    """Intent 6: Set up scheduled briefing (stores config, actual scheduling done via n8n)."""
+    """Intent 6: Schedule a video briefing (one-shot or recurring)."""
     creator_name = params.get("creator", "")
-    frequency = params.get("frequency", "weekly")
-    day = params.get("day", "monday")
+    topic = params.get("topic", "")
+    frequency = params.get("frequency", "once")
+    schedule_time = params.get("schedule_time", "08:00")
+    schedule_date = params.get("schedule_date", "")
+    n = params.get("n", 3)
+    day = params.get("day", "")
     keywords = params.get("keywords", [])
 
-    channel_url = resolve_creator(creator_name) if creator_name else None
+    # Determine task type
+    task_type = "topic" if topic and not creator_name else "channel"
 
-    # Save schedule to a JSON file that n8n can read
+    # Calculate when to fire
+    now = datetime.now()
+    h, m = 8, 0
+    try:
+        h, m = map(int, schedule_time.split(":"))
+    except (ValueError, AttributeError):
+        pass
+
+    if schedule_date:
+        try:
+            target = datetime.strptime(schedule_date, "%Y-%m-%d").replace(hour=h, minute=m, second=0)
+        except ValueError:
+            target = (now + timedelta(days=1)).replace(hour=h, minute=m, second=0, microsecond=0)
+    elif frequency == "once":
+        # Default: tomorrow at schedule_time
+        target = (now + timedelta(days=1)).replace(hour=h, minute=m, second=0, microsecond=0)
+        # If the time is still today and in the future, use today
+        today_target = now.replace(hour=h, minute=m, second=0, microsecond=0)
+        if today_target > now:
+            target = today_target
+    else:
+        # Recurring: start from tomorrow
+        target = (now + timedelta(days=1)).replace(hour=h, minute=m, second=0, microsecond=0)
+
+    delay = (target - now).total_seconds()
+    if delay < 0:
+        # If in the past, schedule for tomorrow
+        target = (now + timedelta(days=1)).replace(hour=h, minute=m, second=0, microsecond=0)
+        delay = (target - now).total_seconds()
+
+    # Build task
     schedules_file = Path(OUTPUT_DIR) / "schedules.json"
     schedules = []
     if schedules_file.exists():
-        schedules = json.loads(schedules_file.read_text())
+        try:
+            schedules = json.loads(schedules_file.read_text())
+        except json.JSONDecodeError:
+            schedules = []
 
-    new_schedule = {
+    task = {
         "id": f"sched-{len(schedules)+1}",
+        "type": task_type,
         "creator": creator_name,
-        "channel_url": channel_url,
+        "topic": topic,
+        "n": n,
         "frequency": frequency,
+        "schedule_time": schedule_time,
         "day": day,
         "keywords": keywords,
         "recipient": sender,
-        "created_at": datetime.now().isoformat(),
+        "created_at": now.isoformat(),
+        "fire_at": target.isoformat(),
         "active": True,
     }
-    schedules.append(new_schedule)
-    schedules_file.write_text(json.dumps(schedules, indent=2))
+    schedules.append(task)
+    schedules_file.write_text(json.dumps(schedules, indent=2, ensure_ascii=False))
 
-    freq_map = {"daily": "ogni giorno", "weekly": f"ogni {day}", "monthly": "ogni mese"}
-    freq_text = freq_map.get(frequency, frequency)
-    topic_text = f" su {', '.join(keywords)}" if keywords else ""
+    # Set timer
+    timer = threading.Timer(delay, _execute_scheduled_task, args=[task])
+    timer.daemon = True
+    timer.start()
+
+    # Build confirmation message
+    subject = creator_name if task_type == "channel" else f'"{topic}"'
+    time_str = target.strftime("%d/%m/%Y alle %H:%M")
+
+    if frequency == "once":
+        freq_text = f"il {time_str}"
+    else:
+        freq_map = {"daily": "ogni giorno", "weekly": f"ogni {day or 'settimana'}", "monthly": "ogni mese"}
+        freq_text = f"{freq_map.get(frequency, frequency)} alle {schedule_time}, a partire dal {time_str}"
 
     send_whatsapp_text(sender,
-        f"✅ Programmato! Riceverai un briefing su {creator_name}{topic_text} {freq_text}.\n\n"
-        f"Per gestire le programmazioni, scrivi \"le mie programmazioni\".")
-    print(f"  📅 Schedule saved: {new_schedule['id']}")
+        f"✅ *Programmato!*\n\n"
+        f"📺 {n} video di {subject}\n"
+        f"📅 {freq_text}\n\n"
+        f"Riceverai il briefing audio automaticamente! 🎙️")
+    print(f"  📅 Schedule saved: {task['id']} — fires at {target.isoformat()} (in {delay:.0f}s)")
 
 
 def handle_news_search(params: dict, sender: str):
@@ -1430,10 +1569,54 @@ class WebhookHandler(BaseHTTPRequestHandler):
         print(f"  [HTTP] {args[0]}" if args else "")
 
 
+def reload_scheduled_tasks():
+    """Reload active scheduled tasks from disk (survives container restarts)."""
+    schedules_file = Path(OUTPUT_DIR) / "schedules.json"
+    if not schedules_file.exists():
+        return
+    try:
+        schedules = json.loads(schedules_file.read_text())
+    except (json.JSONDecodeError, Exception):
+        return
+
+    now = datetime.now()
+    reloaded = 0
+    for task in schedules:
+        if not task.get("active", True):
+            continue
+        fire_at_str = task.get("fire_at", "")
+        frequency = task.get("frequency", "once")
+
+        try:
+            fire_at = datetime.fromisoformat(fire_at_str)
+        except (ValueError, TypeError):
+            continue
+
+        if fire_at > now:
+            # Future task: set timer
+            delay = (fire_at - now).total_seconds()
+            timer = threading.Timer(delay, _execute_scheduled_task, args=[task])
+            timer.daemon = True
+            timer.start()
+            reloaded += 1
+            print(f"  📅 Reloaded task {task['id']}: fires at {fire_at.strftime('%Y-%m-%d %H:%M')} (in {delay:.0f}s)")
+        elif frequency != "once":
+            # Recurring task that missed its window: reschedule
+            _reschedule_recurring(task)
+            reloaded += 1
+
+    if reloaded:
+        print(f"  📅 Reloaded {reloaded} scheduled task(s)")
+
+
 def start_server(port: int = None):
     """Start HTTP server for n8n webhook."""
     if port is None:
         port = int(os.environ.get("PORT", 8787))
+
+    # Reload scheduled tasks from previous runs
+    reload_scheduled_tasks()
+
     server = HTTPServer(("0.0.0.0", port), WebhookHandler)
     print(f"\n🚀 SARAh, l'unclock intelligence — server running on port {port}")
     print(f"   Webhook URL: http://localhost:{port}/webhook")
