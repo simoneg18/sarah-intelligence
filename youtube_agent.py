@@ -409,10 +409,20 @@ def search_youtube(query: str, max_results: int = 10, upload_date: str = None, p
 def get_video_info(url: str) -> Optional[VideoInfo]:
     """Get info for a single video URL."""
     cmd = ["yt-dlp", "--dump-json", "--no-download", url]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-    if result.returncode != 0:
+    print(f"  🔍 yt-dlp fetching: {url}")
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        print(f"  ⚠ yt-dlp timeout for {url}")
         return None
-    data = json.loads(result.stdout)
+    if result.returncode != 0:
+        print(f"  ⚠ yt-dlp error (code {result.returncode}): {result.stderr[:300]}")
+        return None
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as e:
+        print(f"  ⚠ yt-dlp JSON parse error: {e}")
+        return None
     return VideoInfo(
         video_id=data.get("id", ""),
         title=data.get("title", ""),
@@ -1389,7 +1399,28 @@ class WebhookHandler(BaseHTTPRequestHandler):
         threading.Thread(target=_safe_process, args=(message, sender)).start()
 
     def do_GET(self):
-        """Health check."""
+        """Health check + log endpoints."""
+        from urllib.parse import urlparse, parse_qs
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        if path == "/messages":
+            # Return last N messages from message_log.jsonl
+            qs = parse_qs(parsed.query)
+            n = int(qs.get("n", ["20"])[0])
+            try:
+                with open(MESSAGE_LOG, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+                entries = [json.loads(l) for l in lines[-n:]]
+            except FileNotFoundError:
+                entries = []
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(entries, ensure_ascii=False, indent=2).encode())
+            return
+
+        # Default: health check
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
