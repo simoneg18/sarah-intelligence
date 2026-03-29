@@ -239,6 +239,12 @@ INTENTS DISPONIBILI:
    Params: confirmed (boolean — true se conferma, false se rifiuta)
    Esempi: "sì", "ok", "procedi", "vai", "confermo", "no", "annulla", "stop", "non quelli"
 
+10. feedback — L'utente segnala un problema, un errore, o qualcosa che non ha funzionato nella risposta precedente di SARAh.
+   Params: complaint (descrizione del problema), raw_message (messaggio originale)
+   Esempi: "non hai trovato i video", "hai sbagliato", "il briefing non arriva", "non era quello che volevo",
+           "non funziona", "il video non è quello giusto", "mi hai mandato roba vecchia",
+           "hai capito male", "non era questa la mia richiesta", "errore", "non va"
+
 Rispondi ESCLUSIVAMENTE con un JSON valido, nient'altro:
 {"intent": "nome_intent", "params": {...}, "confidence": 0.0-1.0}
 
@@ -1445,6 +1451,60 @@ Rispondi in modo conciso (max 3-4 frasi) su WhatsApp. Non usare markdown pesante
     print(f"  💬 Replied: {reply[:100]}...")
 
 
+def handle_feedback(params: dict, sender: str):
+    """Handle user complaints: read recent logs, diagnose the issue, respond with explanation."""
+    complaint = params.get("complaint", params.get("raw_message", ""))
+    print(f"  🐛 Feedback/complaint: \"{complaint}\"")
+
+    # Read recent message log entries for this sender to understand what went wrong
+    recent_logs = []
+    try:
+        with open(MESSAGE_LOG, "r", encoding="utf-8") as f:
+            all_entries = [json.loads(l) for l in f.readlines() if l.strip()]
+        # Get last 10 entries from this sender (excluding current feedback)
+        sender_entries = [e for e in all_entries if e.get("sender") == sender]
+        recent_logs = sender_entries[-10:]
+    except (FileNotFoundError, Exception) as e:
+        print(f"  ⚠ Could not read logs: {e}")
+
+    # Build context for Claude to diagnose
+    log_context = ""
+    if recent_logs:
+        log_context = "Storico recente delle interazioni di questo utente:\n"
+        for entry in recent_logs:
+            log_context += f"- [{entry.get('ts', '?')}] Messaggio: \"{entry.get('message', '')}\" → Intent: {entry.get('intent', '?')}, Params: {json.dumps(entry.get('params', {}), ensure_ascii=False)}, Outcome: {entry.get('outcome', '?')}\n"
+
+    mood = get_sarah_mood()
+    client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=1024,
+        system=f"""Sei SARAh, l'unclock intelligence. L'utente sta segnalando un problema con la tua risposta precedente.
+Il tuo umore oggi: {mood['mood']} {mood['emoji']}.
+
+{log_context}
+
+Analizza il problema basandoti su:
+1. Il reclamo dell'utente
+2. Lo storico delle interazioni recenti (intent, params, outcome)
+3. Possibili cause: intent sbagliato, parametri persi, video non trovati, errore tecnico
+
+Rispondi in italiano, in modo empatico e utile:
+- Riconosci il problema
+- Spiega brevemente cosa potrebbe essere andato storto
+- Suggerisci come riformulare la richiesta per ottenere risultati migliori
+- Se possibile, offri di riprovare subito
+
+Sii concisa (max 4-5 frasi). Non usare markdown pesante.""",
+        messages=[{"role": "user", "content": complaint}],
+    )
+
+    reply = response.content[0].text.strip()
+    send_whatsapp_text(sender, reply)
+    print(f"  🐛 Feedback reply: {reply[:100]}...")
+
+
 # Intent routing
 INTENT_HANDLERS = {
     "channel_analysis": handle_channel_analysis,
@@ -1456,6 +1516,7 @@ INTENT_HANDLERS = {
     "news_search": handle_news_search,
     "greeting": handle_greeting,
     "confirmation": handle_confirmation,
+    "feedback": handle_feedback,
     "unknown": handle_unknown,
 }
 
