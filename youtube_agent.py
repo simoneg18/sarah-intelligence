@@ -217,8 +217,14 @@ INTENTS DISPONIBILI:
    Params: creator (nome), n (numero video, default 3), frequency ("once", "daily", "weekly", "monthly"),
            schedule_time (orario HH:MM, default "08:00"), schedule_date (data YYYY-MM-DD per invii one-shot, opzionale),
            day (opzionale: "monday", etc. per ricorrenti), keywords (opzionale), topic (opzionale, per ricerche per tema)
-   Esempi: "mandami gli ultimi 3 video di enkk domani alle 8", "aggiornami ogni lunedì sui video di Chase",
-           "programmami un briefing su Cole Medin per domani mattina", "ogni venerdì mandami i video su AI agents"
+   IMPORTANTE per frequency:
+   - Se l'utente dice "domani alle 8", "per domani mattina", "oggi pomeriggio" → frequency="once"
+   - Se dice "ogni lunedì", "ogni giorno", "settimanalmente" → frequency="weekly"/"daily"/"monthly"
+   - Se non specifica ripetizione, default a "once"
+   Esempi: "mandami gli ultimi 3 video di enkk domani alle 8" → frequency="once"
+           "aggiornami ogni lunedì sui video di Chase" → frequency="weekly"
+           "programmami un briefing su Cole Medin per domani mattina" → frequency="once"
+           "ogni venerdì mandami i video su AI agents" → frequency="weekly"
 
 7. news_search — L'utente vuole le novità su un topic senza specificare un creator.
    Params: topic (argomento), period ("today", "week", "month", default "week"), n (max video, default 5),
@@ -1288,7 +1294,7 @@ def handle_scheduling(params: dict, sender: str):
     topic = params.get("topic", "")
     frequency = params.get("frequency", "once")
     schedule_time = params.get("schedule_time", params.get("time", "08:00"))
-    schedule_date = params.get("schedule_date", "")
+    schedule_date = params.get("schedule_date", params.get("date", ""))
     n = params.get("n", 3)
     day = params.get("day", "")
     keywords = params.get("keywords", [])
@@ -1305,10 +1311,17 @@ def handle_scheduling(params: dict, sender: str):
         pass
 
     if schedule_date:
-        try:
-            target = datetime.strptime(schedule_date, "%Y-%m-%d").replace(hour=h, minute=m, second=0)
-        except ValueError:
+        # Handle relative dates like "tomorrow", "oggi", "domani"
+        date_lower = schedule_date.lower().strip()
+        if date_lower in ("tomorrow", "domani"):
             target = (now + timedelta(days=1)).replace(hour=h, minute=m, second=0, microsecond=0)
+        elif date_lower in ("today", "oggi"):
+            target = now.replace(hour=h, minute=m, second=0, microsecond=0)
+        else:
+            try:
+                target = datetime.strptime(schedule_date, "%Y-%m-%d").replace(hour=h, minute=m, second=0)
+            except ValueError:
+                target = (now + timedelta(days=1)).replace(hour=h, minute=m, second=0, microsecond=0)
     elif frequency == "once":
         # Default: tomorrow at schedule_time
         target = (now + timedelta(days=1)).replace(hour=h, minute=m, second=0, microsecond=0)
