@@ -209,9 +209,10 @@ INTENTS DISPONIBILI:
    Params: creators (lista nomi), topic (argomento), n (video per creator, default 3)
    Esempi: "confronta Chase e Cole Medin su Claude Code", "cosa dicono Chase, Liam e Cole su AI agents"
 
-5. follow_up — L'utente vuole approfondire qualcosa da un'analisi precedente.
+5. follow_up — L'utente vuole approfondire qualcosa da un'analisi precedente (NON sta segnalando un errore).
    Params: question (la domanda di approfondimento)
    Esempi: "approfondisci il punto sugli MCP servers", "dimmi di più sul secondo video", "cosa intendeva Chase con..."
+   NOTA: Se l'utente si LAMENTA o dice che qualcosa non ha funzionato, NON è follow_up → è feedback.
 
 6. scheduling — L'utente vuole programmare un invio di video, sia one-shot che ricorrente.
    Params: creator (nome), n (numero video, default 3), frequency ("once", "daily", "weekly", "monthly"),
@@ -239,11 +240,15 @@ INTENTS DISPONIBILI:
    Params: confirmed (boolean — true se conferma, false se rifiuta)
    Esempi: "sì", "ok", "procedi", "vai", "confermo", "no", "annulla", "stop", "non quelli"
 
-10. feedback — L'utente segnala un problema, un errore, o qualcosa che non ha funzionato nella risposta precedente di SARAh.
+10. feedback — L'utente segnala un PROBLEMA, un ERRORE, o si LAMENTA di qualcosa che SARAh ha fatto male.
    Params: complaint (descrizione del problema), raw_message (messaggio originale)
+   PRIORITÀ ALTA: Se il messaggio contiene lamentele, critiche, o segnalazioni di errore → SEMPRE feedback, MAI follow_up.
+   Parole chiave: "sbagliato", "non funziona", "errore", "non va", "non hai trovato", "hai capito male", "non era quello",
+                  "non è giusto", "roba vecchia", "non arriva", "non quelli", "hai sbagliato", "problema"
    Esempi: "non hai trovato i video", "hai sbagliato", "il briefing non arriva", "non era quello che volevo",
            "non funziona", "il video non è quello giusto", "mi hai mandato roba vecchia",
-           "hai capito male", "non era questa la mia richiesta", "errore", "non va"
+           "hai capito male", "non era questa la mia richiesta", "errore", "non va",
+           "non hai trovato i video che ti avevo chiesto, hai sbagliato"
 
 Rispondi ESCLUSIVAMENTE con un JSON valido, nient'altro:
 {"intent": "nome_intent", "params": {...}, "confidence": 0.0-1.0}
