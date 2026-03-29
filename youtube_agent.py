@@ -1102,8 +1102,8 @@ def handle_channel_analysis(params: dict, sender: str):
     print(f"\n📡 Channel analysis: {creator_name} (last {n}, keywords={keywords})")
 
     all_videos = get_channel_videos(channel_url, max_videos=50)
-    if keywords:
-        all_videos = filter_videos_by_topic(all_videos, keywords)
+    # Keywords are used as analysis focus, NOT as video filter.
+    # Always take the last N videos — the analysis prompt will focus on keywords.
     videos = all_videos[:n]
 
     if not videos:
