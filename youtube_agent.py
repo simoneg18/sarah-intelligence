@@ -514,23 +514,26 @@ def validate_videos(original_request: str, videos: list, search_type: str = "sea
         max_tokens=512,
         system="""Sei il Validator Agent di SARAh. Il tuo ruolo è verificare se i video trovati dal Finder Agent sono coerenti con la richiesta originale dell'utente.
 
-Analizza:
-1. I titoli dei video corrispondono al tema richiesto?
-2. I canali sono quelli giusti (se specificati)?
-3. Le date sono nel periodo richiesto (se specificato)?
-4. I video sono rilevanti per la domanda specifica?
+COSA VALUTARE (in ordine di importanza):
+1. I TITOLI dei video sono pertinenti al tema/argomento richiesto?
+2. Se l'utente ha chiesto un creator specifico, i video sembrano essere di quel creator? (Nota: il campo canale potrebbe essere vuoto — NON penalizzare per metadati mancanti)
+3. Se l'utente ha chiesto un periodo, le date corrispondono? (Nota: le date potrebbero essere vuote — NON penalizzare)
+
+REGOLE IMPORTANTI:
+- Metadati mancanti (canale="?", data="?", views="?") NON sono un problema — è normale. Non segnalare metadati mancanti come issues.
+- Per ricerche su un CANALE specifico: se il sistema ha cercato quel canale, ASSUMI che i video provengano da quel canale. Valuta SOLO se i titoli sono ragionevoli.
+- Concentrati SOLO sulla coerenza tematica tra la richiesta e i titoli dei video.
+- Se almeno il 50% dei video sembra pertinente al tema, valid=true.
+- Se l'utente ha chiesto "gli ultimi N video di X", qualsiasi video di X è valido (non serve che il titolo menzioni il tema — l'utente vuole gli ultimi video IN GENERALE).
 
 Rispondi SOLO con un JSON valido:
 {
   "valid": true/false,
   "score": 0.0-1.0,
-  "issues": ["lista problemi trovati"],
+  "issues": ["solo problemi REALI di coerenza tematica"],
   "suggested_query": "query di ricerca migliorata (solo se valid=false)",
-  "suggested_params": {"modifiche ai parametri (solo se valid=false)"}
-}
-
-Sii ragionevole: se almeno 60% dei video sono pertinenti, considera valid=true.
-Non essere troppo severo sui titoli — un video può essere rilevante anche se il titolo non contiene le keywords esatte.""",
+  "suggested_params": {}
+}""",
         messages=[{"role": "user", "content": f"RICHIESTA UTENTE: {original_request}\n\nTIPO RICERCA: {search_type}\n\nVIDEO TROVATI:\n{video_list}"}],
     )
 
