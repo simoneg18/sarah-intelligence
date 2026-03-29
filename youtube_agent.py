@@ -195,9 +195,15 @@ INTENTS DISPONIBILI:
    Params: url (URL del video)
    Esempi: "analizza questo https://youtube.com/watch?v=abc123", un messaggio che contiene solo un URL YouTube
 
-3. topic_search — L'utente vuole scoprire chi parla di un certo topic, eventualmente filtrato per paese/periodo.
-   Params: topic (argomento), country (opzionale, codice paese), period (opzionale: "week", "month", "today")
-   Esempi: "chi parla di MCP servers?", "creator italiani che parlano di AI agents questa settimana"
+3. topic_search — L'utente vuole scoprire chi parla di un certo topic, eventualmente filtrato per paese/periodo/lingua.
+   Params: topic (argomento), country (opzionale, codice paese es. "IT", "US", "UK", "ES", "DE", "FR"),
+           period (opzionale: "today", "week", "month"), n (numero video, default 5),
+           language (opzionale: "italiano", "english", "español", etc.)
+   NOTE: Se l'utente dice "in Italia", "YouTube Italia", "italiani" → country="IT".
+         Se dice "in inglese", "english" → language="english".
+         Se dice "ultimo mese"/"nell'ultimo mese" → period="month". "ultima settimana" → period="week". "oggi" → period="today".
+   Esempi: "chi parla di MCP servers?", "creator italiani che parlano di AI agents questa settimana",
+           "5 video più visti in Italia sull'AI nell'ultimo mese", "find English videos about Claude Code from this week"
 
 4. multi_creator — L'utente vuole confrontare cosa dicono diversi creator su un topic.
    Params: creators (lista nomi), topic (argomento), n (video per creator, default 3)
@@ -215,7 +221,8 @@ INTENTS DISPONIBILI:
            "programmami un briefing su Cole Medin per domani mattina", "ogni venerdì mandami i video su AI agents"
 
 7. news_search — L'utente vuole le novità su un topic senza specificare un creator.
-   Params: topic (argomento), period ("today", "week", "month", default "week"), n (max video, default 5)
+   Params: topic (argomento), period ("today", "week", "month", default "week"), n (max video, default 5),
+           country (opzionale), language (opzionale)
    Esempi: "novità su Claude Code", "cosa c'è di nuovo su AI agents questa settimana", "ultimi video su n8n"
 
 8. greeting — L'utente saluta SARAh o chiede come sta, o si presenta.
@@ -229,8 +236,10 @@ INTENTS DISPONIBILI:
 Rispondi ESCLUSIVAMENTE con un JSON valido, nient'altro:
 {"intent": "nome_intent", "params": {...}, "confidence": 0.0-1.0}
 
-Se non riesci a classificare, usa:
-{"intent": "unknown", "params": {"raw_message": "..."}, "confidence": 0.0}"""
+IMPORTANTE: Se il messaggio sembra una domanda generica, una richiesta di aiuto, una conversazione, o qualsiasi cosa che non rientra negli intent sopra, usa:
+{"intent": "unknown", "params": {"raw_message": "il messaggio originale"}, "confidence": 0.0}
+
+NON usare unknown se il messaggio riguarda video YouTube, anche se formulato in modo insolito — prova a mapparlo all'intent più vicino."""
 
 
 def parse_intent(message: str) -> dict:
@@ -1107,10 +1116,15 @@ def handle_topic_search(params: dict, sender: str):
     country = params.get("country", "")
     period = params.get("period", "week")
     n = params.get("n", 5)
+    language = params.get("language", "")
 
     query = topic
-    if country:
-        country_map = {"it": "italiano", "italia": "italiano", "us": "english", "uk": "english"}
+    # Add language qualifier to search query
+    if language:
+        query = f"{topic} {language}"
+    elif country:
+        country_map = {"it": "italiano", "italia": "italiano", "us": "english", "uk": "english",
+                       "es": "español", "de": "deutsch", "fr": "français", "br": "português", "jp": "日本語"}
         lang = country_map.get(country.lower(), country)
         query = f"{topic} {lang}"
 
@@ -1383,10 +1397,39 @@ def handle_news_search(params: dict, sender: str):
 
 
 def handle_unknown(params: dict, sender: str):
-    """Fallback for unrecognized messages — stay silent so CArL can handle it."""
-    # Don't respond: message is probably for CArL, not SARAh.
-    # CArL gets all messages in parallel and will handle non-intelligence ones.
-    print(f"  ℹ️ Unknown intent — SARAh stays silent (CArL may handle it)")
+    """Fallback: respond conversationally like a real chatbot."""
+    raw_message = params.get("raw_message", "")
+    print(f"  💬 General conversation: \"{raw_message}\"")
+
+    mood = get_sarah_mood()
+    client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=1024,
+        system=f"""Sei SARAh, l'unclock intelligence — un'assistente AI specializzata nell'analisi di video YouTube.
+Sei simpatica, professionale e parli in italiano. Il tuo umore oggi: {mood['mood']} {mood['emoji']} (meteo Milano: {mood['weather_desc']}).
+
+Rispondi in modo naturale e conversazionale. Se la domanda non riguarda YouTube, rispondi comunque in modo utile ma ricorda gentilmente che il tuo punto forte è l'analisi video YouTube.
+
+Se l'utente sembra voler fare qualcosa legato a YouTube ma non ha formulato bene la richiesta, aiutalo a riformularla suggerendo esempi concreti.
+
+Le tue capacità YouTube:
+- Analisi ultimi video di un creator
+- Riassunto di un video singolo (da link)
+- Ricerca video per topic/tema (con filtri per paese, lingua, periodo)
+- Confronto tra creator su un tema
+- Approfondimento su analisi precedenti
+- Programmazione briefing ricorrenti
+- Ricerca novità su un tema
+
+Rispondi in modo conciso (max 3-4 frasi) su WhatsApp. Non usare markdown pesante.""",
+        messages=[{"role": "user", "content": raw_message}],
+    )
+
+    reply = response.content[0].text.strip()
+    send_whatsapp_text(sender, reply)
+    print(f"  💬 Replied: {reply[:100]}...")
 
 
 # Intent routing
