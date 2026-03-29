@@ -200,9 +200,11 @@ INTENTS DISPONIBILI:
    Params: creator (nome), n (numero video, default 5), keywords (lista filtri topic, opzionale)
    Esempi: "ultimi 5 video di Chase", "cosa ha detto Cole Medin su n8n", "riassumimi gli ultimi 3 video di Liam Ottley"
 
-2. single_video — L'utente manda un URL YouTube specifico da analizzare.
-   Params: url (URL del video)
-   Esempi: "analizza questo https://youtube.com/watch?v=abc123", un messaggio che contiene solo un URL YouTube
+2. single_video — L'utente manda un URL YouTube specifico da analizzare, eventualmente con istruzioni specifiche.
+   Params: url (URL del video), focus (opzionale: richiesta specifica dell'utente, es. "estrai i 5 punti chiave", "riassunto tecnico per manager", "elenca tool e costi")
+   Esempi: "analizza questo https://youtube.com/watch?v=abc123",
+           "https://youtube.com/watch?v=abc — Estrai i 5 punti chiave su come implementare la RAG",
+           "https://youtube.com/watch?v=abc — Fammi un riassunto tecnico ma comprensibile per un manager non-tech"
 
 3. topic_search — L'utente vuole scoprire chi parla di un certo topic, eventualmente filtrato per paese/periodo/lingua.
    Params: topic (argomento), country (opzionale, codice paese es. "IT", "US", "UK", "ES", "DE", "FR"),
@@ -212,7 +214,11 @@ INTENTS DISPONIBILI:
          Se dice "in inglese", "english" → language="english".
          Se dice "ultimo mese"/"nell'ultimo mese" → period="month". "ultima settimana" → period="week". "oggi" → period="today".
    Esempi: "chi parla di MCP servers?", "creator italiani che parlano di AI agents questa settimana",
-           "5 video più visti in Italia sull'AI nell'ultimo mese", "find English videos about Claude Code from this week"
+           "5 video più visti in Italia sull'AI nell'ultimo mese", "find English videos about Claude Code from this week",
+           "Trova i video più recenti che spiegano come usare l'AI per l'analisi predittiva nelle vendite",
+           "Cerca chi sta testando Grok-3 e quali sono i primi feedback sulla sua capacità di coding",
+           "Quali esperti stanno discutendo di AI Sovereign Clouds in Europa?",
+           "Trova video che parlano di Agentic Workflow applicati al Customer Success"
 
 4. multi_creator — L'utente vuole confrontare cosa dicono diversi creator su un topic.
    Params: creators (lista nomi), topic (argomento), n (video per creator, default 3)
@@ -731,9 +737,21 @@ TRASCRIZIONE:
 
 Produci l'analisi dual-layer come da istruzioni."""
 
+USER_PROMPT_TEMPLATE_FOCUSED = """Analizza questa trascrizione del video "{title}" di {creator} ({url}, pubblicato il {date}).
 
-def summarize_with_claude(video: VideoInfo, transcript: str, creator: str) -> dict:
-    """Send transcript to Claude and get structured dual-layer summary."""
+RICHIESTA SPECIFICA DELL'UTENTE:
+{user_focus}
+
+TRASCRIZIONE:
+{transcript}
+
+IMPORTANTE: Rispondi focalizzandoti SPECIFICAMENTE su ciò che l'utente ha chiesto. La richiesta dell'utente ha la priorità.
+Produci comunque l'analisi dual-layer, ma concentrati sulla richiesta specifica."""
+
+
+def summarize_with_claude(video: VideoInfo, transcript: str, creator: str, user_focus: str = "") -> dict:
+    """Send transcript to Claude and get structured dual-layer summary.
+    If user_focus is provided, the analysis prioritizes that specific request."""
     client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
 
     max_chars = 60000
@@ -744,13 +762,23 @@ def summarize_with_claude(video: VideoInfo, transcript: str, creator: str) -> di
     if len(date_formatted) == 8:
         date_formatted = f"{date_formatted[:4]}-{date_formatted[4:6]}-{date_formatted[6:]}"
 
-    user_msg = USER_PROMPT_TEMPLATE.format(
-        title=video.title,
-        creator=creator,
-        url=video.url,
-        date=date_formatted,
-        transcript=transcript,
-    )
+    if user_focus:
+        user_msg = USER_PROMPT_TEMPLATE_FOCUSED.format(
+            title=video.title,
+            creator=creator,
+            url=video.url,
+            date=date_formatted,
+            user_focus=user_focus,
+            transcript=transcript,
+        )
+    else:
+        user_msg = USER_PROMPT_TEMPLATE.format(
+            title=video.title,
+            creator=creator,
+            url=video.url,
+            date=date_formatted,
+            transcript=transcript,
+        )
 
     response = client.messages.create(
         model="claude-sonnet-4-20250514",
@@ -1039,8 +1067,9 @@ def update_index(creator_slug: str, processed_videos: list[dict], output_dir: st
 # Core pipeline (processes a list of videos)
 # ---------------------------------------------------------------------------
 
-def process_videos(videos: list[VideoInfo], creator_name: str, sender: str = None) -> list[dict]:
-    """Analyze a list of videos: transcript → Claude → save markdown. Returns analyses."""
+def process_videos(videos: list[VideoInfo], creator_name: str, sender: str = None, user_focus: str = "") -> list[dict]:
+    """Analyze a list of videos: transcript → Claude → save markdown. Returns analyses.
+    user_focus: the original user request, used to focus the analysis."""
     creator_slug = slugify(creator_name)
     processed = []
     video_analyses = []
@@ -1056,7 +1085,7 @@ def process_videos(videos: list[VideoInfo], creator_name: str, sender: str = Non
 
         print(f"  📝 Transcript: {len(transcript)} chars")
         print("  🤖 Analyzing with Claude...")
-        result = summarize_with_claude(video, transcript, creator_name)
+        result = summarize_with_claude(video, transcript, creator_name, user_focus=user_focus)
         print(f"  🤖 Done ({result['input_tokens']} in / {result['output_tokens']} out tokens)")
 
         save_markdown(video, result["full_text"], creator_slug)
@@ -1177,7 +1206,8 @@ def execute_pending_request(sender: str):
     send_whatsapp_text(sender, f"{mood['emoji']} Perfetto! Ci lavoro subito.\n\n⏱ Tempo stimato: ~{est} minuti\n\nTi mando il briefing audio appena pronto.")
 
     creator_name = params.get("creator", params.get("label", "ricerca"))
-    analyses = process_videos(videos, creator_name, sender)
+    user_focus = params.get("_original_message", "")
+    analyses = process_videos(videos, creator_name, sender, user_focus=user_focus)
     generate_and_send_briefing(analyses, sender, label=f"vo-{slugify(creator_name)}")
 
 
@@ -1268,7 +1298,7 @@ def handle_channel_analysis(params: dict, sender: str):
     est = estimate_minutes(len(videos))
     msg = format_confirmation_message(videos, est, label=creator_name)
     send_whatsapp_text(sender, msg)
-    store_pending_request(sender, "channel_analysis", {"creator": creator_name, "label": creator_name}, videos)
+    store_pending_request(sender, "channel_analysis", {"creator": creator_name, "label": creator_name, "_original_message": original_request}, videos)
 
 
 def handle_single_video(params: dict, sender: str):
@@ -1288,7 +1318,8 @@ def handle_single_video(params: dict, sender: str):
     est = estimate_minutes(1)
     msg = format_confirmation_message([video], est)
     send_whatsapp_text(sender, msg)
-    store_pending_request(sender, "single_video", {"label": "video-singolo"}, [video])
+    original_request = params.get("_original_message", "")
+    store_pending_request(sender, "single_video", {"label": "video-singolo", "_original_message": original_request}, [video])
 
 
 def handle_topic_search(params: dict, sender: str):
@@ -1334,7 +1365,7 @@ def handle_topic_search(params: dict, sender: str):
     est = estimate_minutes(len(videos))
     msg = format_confirmation_message(videos, est, label=f"ricerca \"{topic}\"")
     send_whatsapp_text(sender, msg)
-    store_pending_request(sender, "topic_search", {"label": f"search-{slugify(topic)}"}, videos)
+    store_pending_request(sender, "topic_search", {"label": f"search-{slugify(topic)}", "_original_message": original_request}, videos)
 
 
 def handle_multi_creator(params: dict, sender: str):
@@ -1609,7 +1640,7 @@ def handle_news_search(params: dict, sender: str):
     est = estimate_minutes(len(videos))
     msg = format_confirmation_message(videos, est, label=f"novità su \"{topic}\"")
     send_whatsapp_text(sender, msg)
-    store_pending_request(sender, "news_search", {"label": f"news-{slugify(topic)}", "creator": f"news-{slugify(topic)}"}, videos)
+    store_pending_request(sender, "news_search", {"label": f"news-{slugify(topic)}", "creator": f"news-{slugify(topic)}", "_original_message": original_request}, videos)
 
 
 def handle_unknown(params: dict, sender: str):
