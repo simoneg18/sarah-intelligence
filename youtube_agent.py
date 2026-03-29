@@ -49,6 +49,15 @@ KNOWN_CREATORS = {
     "matt wolfe": "https://www.youtube.com/@maboroshi",
     "ai jason": "https://www.youtube.com/@AIJasonZ",
     "enkk": "https://www.youtube.com/@Enkk",
+    "two minute papers": "https://www.youtube.com/@TwoMinutePapers",
+    "andrej karpathy": "https://www.youtube.com/@AndrejKarpathy",
+    "karpathy": "https://www.youtube.com/@AndrejKarpathy",
+    "the rundown ai": "https://www.youtube.com/@TheRundownAI",
+    "rundown ai": "https://www.youtube.com/@TheRundownAI",
+    "openai": "https://www.youtube.com/@OpenAI",
+    "y combinator": "https://www.youtube.com/@ycombinator",
+    "ycombinator": "https://www.youtube.com/@ycombinator",
+    "yc": "https://www.youtube.com/@ycombinator",
 }
 
 # Conversation memory for follow-up intent (in-memory, resets on restart)
