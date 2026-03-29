@@ -1577,8 +1577,20 @@ def process_whatsapp_message(message: str, sender: str = None):
 
     # --- Step 2: Fast pattern matching (no API call) ---
 
+    # 2a-pre. Complaint/feedback detection (keyword-based, high priority)
+    _complaint_phrases = [
+        "hai sbagliato", "non funziona", "non ha funzionato", "non va",
+        "hai capito male", "non era quello", "non era questa", "non è giusto",
+        "non hai trovato", "non hai capito", "roba vecchia", "video sbagliati",
+        "non arriva", "non mi arriva", "errore", "c'è un errore", "c'è un problema",
+        "non è quello che volevo", "non è quello che ti ho chiesto",
+        "mi hai mandato", "hai mandato sbagliato", "non quelli",
+    ]
+    if any(phrase in lower_msg for phrase in _complaint_phrases):
+        intent_result = {"intent": "feedback", "params": {"complaint": message, "raw_message": message}, "confidence": 1.0}
+
     # 2a. Pure greeting (ONLY if message is short and greeting-only)
-    if _is_short_greeting(lower_msg):
+    elif _is_short_greeting(lower_msg):
         asks_mood = any(q in lower_msg for q in ["come stai", "come va", "come ti senti", "tutto bene", "che umore", "come sta sarah", "come sta sara"])
         intent_result = {"intent": "greeting", "params": {"asks_mood": asks_mood}, "confidence": 1.0}
 
