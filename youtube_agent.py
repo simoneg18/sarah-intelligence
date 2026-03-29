@@ -366,20 +366,22 @@ def search_youtube(query: str, max_results: int = 10, upload_date: str = None, p
 
     print(f"  🔍 Found {len(video_ids)} candidates, fetching full metadata...")
 
-    # Step 2: fetch full metadata (gets channel, views, likes, upload_date)
-    urls = [f"https://www.youtube.com/watch?v={vid_id}" for vid_id in video_ids]
-    cmd2 = ["yt-dlp", "--dump-json", "--no-download"] + urls
-    result2 = subprocess.run(cmd2, capture_output=True, text=True, timeout=300)
-
+    # Step 2: fetch full metadata ONE BY ONE (bulk fetch fails on Railway)
     videos = []
     skipped_date = 0
-    for line in result2.stdout.strip().split("\n"):
-        if not line:
-            continue
+    fetch_errors = 0
+    for vid_id in video_ids:
+        url = f"https://www.youtube.com/watch?v={vid_id}"
+        cmd2 = ["yt-dlp", "--dump-json", "--no-download", url]
         try:
-            data = json.loads(line)
+            result2 = subprocess.run(cmd2, capture_output=True, text=True, timeout=60)
+            if result2.returncode != 0:
+                fetch_errors += 1
+                print(f"  ⚠ Failed to fetch {vid_id}: {result2.stderr[:200]}")
+                continue
+            data = json.loads(result2.stdout.strip())
             vid_upload_date = data.get("upload_date", "")
-            # Post-fetch date filter as safety net (upload_date is YYYYMMDD)
+            # Post-fetch date filter (upload_date is YYYYMMDD)
             if upload_date and vid_upload_date and vid_upload_date < upload_date:
                 skipped_date += 1
                 continue
@@ -394,11 +396,16 @@ def search_youtube(query: str, max_results: int = 10, upload_date: str = None, p
                 view_count=data.get("view_count") or 0,
                 like_count=data.get("like_count") or 0,
             ))
-        except json.JSONDecodeError:
+            # Stop early if we have enough valid videos
+            if len(videos) >= max_results * 2:
+                break
+        except (json.JSONDecodeError, subprocess.TimeoutExpired) as e:
+            fetch_errors += 1
+            print(f"  ⚠ Error fetching {vid_id}: {e}")
             continue
 
     if upload_date:
-        print(f"  🗓 Date filter: kept {len(videos)}, skipped {skipped_date} (before {upload_date})")
+        print(f"  🗓 Date filter: kept {len(videos)}, skipped {skipped_date}, errors {fetch_errors} (before {upload_date})")
 
     # Sort by view count (most viewed first) so we return the most popular results
     videos.sort(key=lambda v: v.view_count, reverse=True)
@@ -1266,7 +1273,7 @@ def handle_scheduling(params: dict, sender: str):
     creator_name = params.get("creator", "")
     topic = params.get("topic", "")
     frequency = params.get("frequency", "once")
-    schedule_time = params.get("schedule_time", "08:00")
+    schedule_time = params.get("schedule_time", params.get("time", "08:00"))
     schedule_date = params.get("schedule_date", "")
     n = params.get("n", 3)
     day = params.get("day", "")
