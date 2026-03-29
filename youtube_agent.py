@@ -491,6 +491,145 @@ def filter_videos_by_topic(videos: list[VideoInfo], keywords: list[str]) -> list
     return filtered
 
 
+# ---------------------------------------------------------------------------
+# Validator Agent ↔ Finder Agent loop
+# ---------------------------------------------------------------------------
+
+MAX_VALIDATION_RETRIES = 2
+
+def validate_videos(original_request: str, videos: list, search_type: str = "search") -> dict:
+    """Validator Agent: checks if found videos are coherent with the user's request.
+    Returns {"valid": True/False, "feedback": "...", "suggested_query": "..."}"""
+    if not videos:
+        return {"valid": False, "feedback": "Nessun video trovato.", "suggested_query": ""}
+
+    video_list = "\n".join(
+        f"{i+1}. \"{v.title}\" — canale: {v.channel or '?'}, views: {v.view_count or '?'}, data: {v.upload_date or '?'}"
+        for i, v in enumerate(videos)
+    )
+
+    client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=512,
+        system="""Sei il Validator Agent di SARAh. Il tuo ruolo è verificare se i video trovati dal Finder Agent sono coerenti con la richiesta originale dell'utente.
+
+Analizza:
+1. I titoli dei video corrispondono al tema richiesto?
+2. I canali sono quelli giusti (se specificati)?
+3. Le date sono nel periodo richiesto (se specificato)?
+4. I video sono rilevanti per la domanda specifica?
+
+Rispondi SOLO con un JSON valido:
+{
+  "valid": true/false,
+  "score": 0.0-1.0,
+  "issues": ["lista problemi trovati"],
+  "suggested_query": "query di ricerca migliorata (solo se valid=false)",
+  "suggested_params": {"modifiche ai parametri (solo se valid=false)"}
+}
+
+Sii ragionevole: se almeno 60% dei video sono pertinenti, considera valid=true.
+Non essere troppo severo sui titoli — un video può essere rilevante anche se il titolo non contiene le keywords esatte.""",
+        messages=[{"role": "user", "content": f"RICHIESTA UTENTE: {original_request}\n\nTIPO RICERCA: {search_type}\n\nVIDEO TROVATI:\n{video_list}"}],
+    )
+
+    text = response.content[0].text.strip()
+    try:
+        if "```" in text:
+            match = re.search(r'```(?:json)?\s*(.*?)\s*```', text, re.DOTALL)
+            if match:
+                text = match.group(1)
+        result = json.loads(text)
+        print(f"  🔍 Validator: valid={result.get('valid')} score={result.get('score')} issues={result.get('issues', [])}")
+        return result
+    except json.JSONDecodeError:
+        print(f"  ⚠ Validator JSON parse error, assuming valid")
+        return {"valid": True, "score": 0.5, "issues": ["parse error"]}
+
+
+def retry_search_with_feedback(
+    feedback: dict,
+    original_request: str,
+    search_fn: str,
+    original_params: dict,
+    attempt: int,
+) -> list:
+    """Finder Agent retry: uses Validator feedback to improve search."""
+    suggested_query = feedback.get("suggested_query", "")
+    suggested_params = feedback.get("suggested_params", {})
+    issues = feedback.get("issues", [])
+
+    print(f"  🔄 Finder Agent retry #{attempt}: issues={issues}")
+    print(f"  🔄 Suggested query: {suggested_query}")
+    print(f"  🔄 Suggested params: {suggested_params}")
+
+    if search_fn == "channel":
+        # For channel searches, not much we can retry — the channel is the channel
+        # But we can try fetching more videos
+        creator_name = original_params.get("creator", "")
+        channel_url = resolve_creator(creator_name)
+        if not channel_url:
+            return []
+        n = original_params.get("n", 5)
+        all_videos = get_channel_videos(channel_url, max_videos=100)
+        # If validator suggested specific keywords, try filtering
+        if suggested_query:
+            filtered = filter_videos_by_topic(all_videos, suggested_query.split())
+            if filtered:
+                return filtered[:n]
+        return all_videos[:n]
+
+    elif search_fn == "topic" or search_fn == "news":
+        # Use suggested query or improve the original
+        query = suggested_query or original_params.get("query", original_params.get("topic", ""))
+        n = suggested_params.get("n", original_params.get("n", 5))
+        period = suggested_params.get("period", original_params.get("period", None))
+        date_after = period_to_dateafter(period) if period else None
+
+        print(f"  🔄 Retrying search: \"{query}\" (period={period}, n={n})")
+        return search_youtube(query, max_results=n, upload_date=date_after, period=period)
+
+    return []
+
+
+def validated_search(
+    original_request: str,
+    videos: list,
+    search_fn: str,
+    search_params: dict,
+    sender: str = None,
+) -> list:
+    """Run the Validator ↔ Finder loop. Returns validated video list."""
+    for attempt in range(MAX_VALIDATION_RETRIES + 1):
+        if not videos:
+            break
+
+        validation = validate_videos(original_request, videos, search_type=search_fn)
+
+        if validation.get("valid", True):
+            if attempt > 0:
+                print(f"  ✅ Validator approved after {attempt} retry(ies)")
+            else:
+                print(f"  ✅ Validator approved on first pass (score={validation.get('score', '?')})")
+            return videos
+
+        # Not valid — retry if we have attempts left
+        if attempt < MAX_VALIDATION_RETRIES:
+            print(f"  ❌ Validator rejected (score={validation.get('score', '?')}), retrying...")
+            videos = retry_search_with_feedback(
+                feedback=validation,
+                original_request=original_request,
+                search_fn=search_fn,
+                original_params=search_params,
+                attempt=attempt + 1,
+            )
+        else:
+            print(f"  ⚠ Validator still not satisfied after {MAX_VALIDATION_RETRIES} retries, using best results")
+
+    return videos
+
+
 def get_transcript(video_id: str) -> Optional[str]:
     """Fetch transcript for a video. Tries multiple languages."""
     api = YouTubeTranscriptApi()
@@ -1099,15 +1238,28 @@ def handle_channel_analysis(params: dict, sender: str):
         send_whatsapp_text(sender, f"❌ Non conosco il creator \"{creator_name}\". Prova con un URL YouTube o aggiungilo alla lista dei creator conosciuti.")
         return
 
+    # Reconstruct original request from params for validation
+    original_request = params.get("_original_message", f"ultimi {n} video di {creator_name}")
     print(f"\n📡 Channel analysis: {creator_name} (last {n}, keywords={keywords})")
 
     all_videos = get_channel_videos(channel_url, max_videos=50)
-    # Keywords are used as analysis focus, NOT as video filter.
-    # Always take the last N videos — the analysis prompt will focus on keywords.
     videos = all_videos[:n]
 
     if not videos:
         send_whatsapp_text(sender, f"⚠️ Nessun video trovato per {creator_name}.")
+        return
+
+    # Validator ↔ Finder loop
+    videos = validated_search(
+        original_request=original_request,
+        videos=videos,
+        search_fn="channel",
+        search_params={"creator": creator_name, "n": n, "keywords": keywords},
+        sender=sender,
+    )
+
+    if not videos:
+        send_whatsapp_text(sender, f"⚠️ Nessun video coerente trovato per {creator_name}.")
         return
 
     est = estimate_minutes(len(videos))
@@ -1157,9 +1309,23 @@ def handle_topic_search(params: dict, sender: str):
     date_after = period_to_dateafter(period)
     print(f"\n📡 Topic search: \"{query}\" (period={period}, n={n})")
 
+    original_request = params.get("_original_message", f"video su {topic}")
     videos = search_youtube(query, max_results=n, upload_date=date_after, period=period)
     if not videos:
         send_whatsapp_text(sender, f"⚠️ Nessun video trovato per \"{topic}\".")
+        return
+
+    # Validator ↔ Finder loop
+    videos = validated_search(
+        original_request=original_request,
+        videos=videos,
+        search_fn="topic",
+        search_params={"topic": topic, "query": query, "n": n, "period": period},
+        sender=sender,
+    )
+
+    if not videos:
+        send_whatsapp_text(sender, f"⚠️ Nessun video coerente trovato per \"{topic}\".")
         return
 
     est = estimate_minutes(len(videos))
@@ -1418,9 +1584,23 @@ def handle_news_search(params: dict, sender: str):
     date_after = period_to_dateafter(period)
     print(f"\n📡 News search: \"{topic}\" (period={period}, n={n})")
 
+    original_request = params.get("_original_message", f"novità su {topic}")
     videos = search_youtube(topic, max_results=n, upload_date=date_after, period=period)
     if not videos:
         send_whatsapp_text(sender, f"⚠️ Nessun video recente trovato su \"{topic}\".")
+        return
+
+    # Validator ↔ Finder loop
+    videos = validated_search(
+        original_request=original_request,
+        videos=videos,
+        search_fn="news",
+        search_params={"topic": topic, "query": topic, "n": n, "period": period},
+        sender=sender,
+    )
+
+    if not videos:
+        send_whatsapp_text(sender, f"⚠️ Nessun video coerente trovato su \"{topic}\".")
         return
 
     est = estimate_minutes(len(videos))
@@ -1638,6 +1818,9 @@ def process_whatsapp_message(message: str, sender: str = None):
     print(f"   Intent: {intent} (confidence: {confidence})")
     print(f"   Params: {params}")
 
+    # Pass original message to handlers for Validator Agent context
+    params["_original_message"] = message
+
     handler = INTENT_HANDLERS.get(intent, handle_unknown)
     handler(params, sender)
 
@@ -1769,7 +1952,7 @@ def start_server(port: int = None):
 
     server = HTTPServer(("0.0.0.0", port), WebhookHandler)
     print(f"\n🚀 SARAh, l'unclock intelligence — server running on port {port}")
-    print(f"   Version: 2026-03-29-v2 (feedback-intent)")
+    print(f"   Version: 2026-03-29-v3 (validator-agent)")
     print(f"   Webhook URL: http://localhost:{port}/webhook")
     print(f"   Health check: http://localhost:{port}/health")
     print(f"\n   Waiting for WhatsApp messages...\n")
