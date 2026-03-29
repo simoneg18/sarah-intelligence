@@ -1760,6 +1760,7 @@ def start_server(port: int = None):
 
     server = HTTPServer(("0.0.0.0", port), WebhookHandler)
     print(f"\n🚀 SARAh, l'unclock intelligence — server running on port {port}")
+    print(f"   Version: 2026-03-29-v2 (feedback-intent)")
     print(f"   Webhook URL: http://localhost:{port}/webhook")
     print(f"   Health check: http://localhost:{port}/health")
     print(f"\n   Waiting for WhatsApp messages...\n")
