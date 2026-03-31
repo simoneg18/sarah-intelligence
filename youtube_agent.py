@@ -1975,7 +1975,12 @@ def process_whatsapp_message(message: str, sender: str = None):
     # 2a. Pure greeting (ONLY if message is short and greeting-only)
     elif _is_short_greeting(lower_msg):
         asks_mood = any(q in lower_msg for q in ["come stai", "come va", "come ti senti", "tutto bene", "che umore", "come sta sarah", "come sta sara"])
-        intent_result = {"intent": "greeting", "params": {"asks_mood": asks_mood}, "confidence": 1.0}
+        # Extract name if user introduces themselves: "sono X", "mi chiamo X"
+        detected_name = ""
+        name_match = re.search(r'(?:sono|mi chiamo|chiamami)\s+(\w+)', lower_msg, re.IGNORECASE)
+        if name_match:
+            detected_name = name_match.group(1).capitalize()
+        intent_result = {"intent": "greeting", "params": {"asks_mood": asks_mood, "name": detected_name}, "confidence": 1.0}
 
     # 2b. Confirmation — only if pending request exists
     elif sender in _pending_requests:
