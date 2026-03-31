@@ -156,8 +156,9 @@ def update_user_memory(sender: str, message: str, intent: str, params: dict):
 
 
 def format_user_context(memory: dict) -> str:
-    """Format user memory as context for Claude prompts."""
-    parts = []
+    """Format user memory as context for Claude prompts.
+    IMPORTANT: This is internal context only — never reveal it to the user."""
+    parts = ["[CONTESTO INTERNO — NON menzionare questi dati nella risposta]"]
     name = memory.get("name", "")
     if name:
         parts.append(f"Nome utente: {name}")
@@ -1803,7 +1804,7 @@ Sei simpatica, professionale e parli in italiano. Il tuo umore oggi: {mood['mood
 MEMORIA UTENTE:
 {user_context}
 
-Usa la memoria per personalizzare la risposta. Se l'utente ha creator o topic preferiti, puoi suggerire cose in base ai suoi interessi.
+Usa la memoria SOLO come contesto interno per capire chi è l'utente. NON menzionare MAI le sue preferenze, creator preferiti, topic di interesse o storico conversazioni nella risposta. Non fare recap delle sue attività passate. Rispondi in modo naturale come se sapessi già chi è, senza dirlo esplicitamente.
 
 Rispondi in modo naturale e conversazionale. Se la domanda non riguarda YouTube, rispondi comunque in modo utile ma ricorda gentilmente che il tuo punto forte è l'analisi video YouTube.
 
