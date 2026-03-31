@@ -1367,18 +1367,6 @@ def handle_greeting(params: dict, sender: str):
         lines.append(f"\nOggi a Milano: {mood['weather_desc']}, {mood['temp']}°C.")
         lines.append(f"Il mio umore? Sono {mood['mood']}! {mood['emoji']}\n")
 
-    # Show recent context for returning users
-    fav_creators = memory.get("favorite_creators", [])
-    topics = memory.get("topics_of_interest", [])
-
-    if fav_creators or topics:
-        lines.append("")
-        if fav_creators:
-            lines.append(f"📌 I tuoi creator: {', '.join(fav_creators[:3])}")
-        if topics:
-            lines.append(f"🔖 I tuoi topic: {', '.join(topics[:3])}")
-        lines.append("")
-
     if msg_count == 0:
         # First time user — show full capabilities
         lines.append("\nCome posso aiutarti? Ecco cosa so fare:\n")
