@@ -69,6 +69,124 @@ _pending_requests = {}
 # Message log file
 MESSAGE_LOG = os.path.join(OUTPUT_DIR, "message_log.jsonl")
 
+# ---------------------------------------------------------------------------
+# Per-user persistent memory (multi-tenant)
+# ---------------------------------------------------------------------------
+
+USERS_DIR = os.path.join(OUTPUT_DIR, "users")
+
+def _user_memory_path(sender: str) -> str:
+    """Return path to user's memory file."""
+    return os.path.join(USERS_DIR, sender, "memory.json")
+
+
+def load_user_memory(sender: str) -> dict:
+    """Load persistent memory for a user. Creates default if not found."""
+    path = _user_memory_path(sender)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.loads(f.read())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {
+            "sender": sender,
+            "name": "",
+            "first_seen": datetime.now().isoformat(),
+            "last_seen": "",
+            "message_count": 0,
+            "language": "it",
+            "favorite_creators": [],
+            "topics_of_interest": [],
+            "recent_interactions": [],  # last 20 interactions [{ts, message, intent, summary}]
+            "preferences": {},  # user-specific prefs
+        }
+
+
+def save_user_memory(sender: str, memory: dict):
+    """Save user memory to disk."""
+    path = _user_memory_path(sender)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    memory["last_seen"] = datetime.now().isoformat()
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(json.dumps(memory, ensure_ascii=False, indent=2))
+
+
+def update_user_memory(sender: str, message: str, intent: str, params: dict):
+    """Update user memory after processing a message."""
+    memory = load_user_memory(sender)
+    memory["message_count"] = memory.get("message_count", 0) + 1
+    memory["last_seen"] = datetime.now().isoformat()
+
+    # Detect user name from greeting
+    if intent == "greeting" and params.get("name"):
+        memory["name"] = params["name"]
+
+    # Track favorite creators
+    creator = params.get("creator", "")
+    if creator and intent in ("channel_analysis", "scheduling", "multi_creator"):
+        fav = memory.get("favorite_creators", [])
+        # Move to front if already present, else add
+        creator_lower = creator.lower()
+        fav = [c for c in fav if c.lower() != creator_lower]
+        fav.insert(0, creator)
+        memory["favorite_creators"] = fav[:10]  # keep top 10
+
+    # Track topics of interest
+    topic = params.get("topic", "")
+    if topic and intent in ("topic_search", "news_search", "scheduling"):
+        topics = memory.get("topics_of_interest", [])
+        topic_lower = topic.lower()
+        topics = [t for t in topics if t.lower() != topic_lower]
+        topics.insert(0, topic)
+        memory["topics_of_interest"] = topics[:15]  # keep top 15
+
+    # Add to recent interactions (keep last 20)
+    interaction = {
+        "ts": datetime.now().isoformat(),
+        "message": message[:200],  # truncate long messages
+        "intent": intent,
+        "creator": creator,
+        "topic": topic,
+    }
+    recent = memory.get("recent_interactions", [])
+    recent.append(interaction)
+    memory["recent_interactions"] = recent[-20:]
+
+    save_user_memory(sender, memory)
+    return memory
+
+
+def format_user_context(memory: dict) -> str:
+    """Format user memory as context for Claude prompts."""
+    parts = []
+    name = memory.get("name", "")
+    if name:
+        parts.append(f"Nome utente: {name}")
+
+    fav = memory.get("favorite_creators", [])
+    if fav:
+        parts.append(f"Creator preferiti: {', '.join(fav[:5])}")
+
+    topics = memory.get("topics_of_interest", [])
+    if topics:
+        parts.append(f"Topic di interesse: {', '.join(topics[:5])}")
+
+    msg_count = memory.get("message_count", 0)
+    if msg_count > 1:
+        parts.append(f"Messaggi totali: {msg_count}")
+
+    recent = memory.get("recent_interactions", [])
+    if recent:
+        last_5 = recent[-5:]
+        history_lines = []
+        for r in last_5:
+            ts = r.get("ts", "")[:16].replace("T", " ")
+            msg = r.get("message", "")[:80]
+            intent = r.get("intent", "?")
+            history_lines.append(f"  [{ts}] ({intent}) {msg}")
+        parts.append("Ultime interazioni:\n" + "\n".join(history_lines))
+
+    return "\n".join(parts) if parts else "Utente nuovo, prima interazione."
+
 
 def _normalize_sender(sender: str) -> str:
     """Normalize sender phone number — strip + prefix for consistency."""
@@ -1212,9 +1330,17 @@ def execute_pending_request(sender: str):
 
 
 def handle_greeting(params: dict, sender: str):
-    """Intent 8: Greet the user. Show mood only if they ask."""
+    """Intent 8: Greet the user. Personalized with memory."""
     asks_mood = params.get("asks_mood", False)
     name = params.get("name", "")
+    memory = load_user_memory(sender)
+
+    # Use name from params or from memory
+    if name:
+        memory["name"] = name
+        save_user_memory(sender, memory)
+    else:
+        name = memory.get("name", "")
     greeting_name = f" {name}" if name else ""
 
     hour = datetime.now().hour
@@ -1226,21 +1352,45 @@ def handle_greeting(params: dict, sender: str):
         time_greeting = "Buonasera"
 
     lines = [f"*SARAh, l'unclock intelligence*\n"]
-    lines.append(f"{time_greeting}{greeting_name}! Sono SARAh.")
+
+    # Personalized greeting for returning users
+    msg_count = memory.get("message_count", 0)
+    if msg_count > 5 and name:
+        lines.append(f"{time_greeting} {name}! Bentornato/a!")
+    elif msg_count > 0 and name:
+        lines.append(f"{time_greeting} {name}! Sono SARAh.")
+    else:
+        lines.append(f"{time_greeting}{greeting_name}! Sono SARAh.")
 
     if asks_mood:
         mood = get_sarah_mood()
         lines.append(f"\nOggi a Milano: {mood['weather_desc']}, {mood['temp']}°C.")
         lines.append(f"Il mio umore? Sono {mood['mood']}! {mood['emoji']}\n")
 
-    lines.append("\nCome posso aiutarti? Ecco cosa so fare:\n")
-    lines.append("📹 Analisi canale — _\"ultimi 3 video di Chase\"_")
-    lines.append("🔗 Video singolo — _manda un link YouTube_")
-    lines.append("🔍 Cerca topic — _\"chi parla di MCP servers?\"_")
-    lines.append("⚔️ Confronto — _\"confronta Chase e Cole su Claude Code\"_")
-    lines.append("💬 Approfondimento — _\"approfondisci il punto su...\"_")
-    lines.append("📅 Programmazione — _\"aggiornami ogni lunedì su Chase\"_")
-    lines.append("📰 Novità — _\"novità su AI agents questa settimana\"_")
+    # Show recent context for returning users
+    fav_creators = memory.get("favorite_creators", [])
+    topics = memory.get("topics_of_interest", [])
+
+    if fav_creators or topics:
+        lines.append("")
+        if fav_creators:
+            lines.append(f"📌 I tuoi creator: {', '.join(fav_creators[:3])}")
+        if topics:
+            lines.append(f"🔖 I tuoi topic: {', '.join(topics[:3])}")
+        lines.append("")
+
+    if msg_count == 0:
+        # First time user — show full capabilities
+        lines.append("\nCome posso aiutarti? Ecco cosa so fare:\n")
+        lines.append("📹 Analisi canale — _\"ultimi 3 video di Chase\"_")
+        lines.append("🔗 Video singolo — _manda un link YouTube_")
+        lines.append("🔍 Cerca topic — _\"chi parla di MCP servers?\"_")
+        lines.append("⚔️ Confronto — _\"confronta Chase e Cole su Claude Code\"_")
+        lines.append("💬 Approfondimento — _\"approfondisci il punto su...\"_")
+        lines.append("📅 Programmazione — _\"aggiornami ogni lunedì su Chase\"_")
+        lines.append("📰 Novità — _\"novità su AI agents questa settimana\"_")
+    else:
+        lines.append("\nCosa vuoi sapere oggi?")
 
     send_whatsapp_text(sender, "\n".join(lines))
 
@@ -1644,18 +1794,28 @@ def handle_news_search(params: dict, sender: str):
 
 
 def handle_unknown(params: dict, sender: str):
-    """Fallback: respond conversationally like a real chatbot."""
+    """Fallback: respond conversationally like a real chatbot, with user memory."""
     raw_message = params.get("raw_message", "")
     print(f"  💬 General conversation: \"{raw_message}\"")
 
     mood = get_sarah_mood()
+    memory = load_user_memory(sender)
+    user_context = format_user_context(memory)
+    user_name = memory.get("name", "")
+    name_instruction = f"\nL'utente si chiama {user_name}. Chiamalo per nome." if user_name else ""
+
     client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
 
     response = client.messages.create(
         model="claude-sonnet-4-20250514",
         max_tokens=1024,
         system=f"""Sei SARAh, l'unclock intelligence — un'assistente AI specializzata nell'analisi di video YouTube.
-Sei simpatica, professionale e parli in italiano. Il tuo umore oggi: {mood['mood']} {mood['emoji']} (meteo Milano: {mood['weather_desc']}).
+Sei simpatica, professionale e parli in italiano. Il tuo umore oggi: {mood['mood']} {mood['emoji']} (meteo Milano: {mood['weather_desc']}).{name_instruction}
+
+MEMORIA UTENTE:
+{user_context}
+
+Usa la memoria per personalizzare la risposta. Se l'utente ha creator o topic preferiti, puoi suggerire cose in base ai suoi interessi.
 
 Rispondi in modo naturale e conversazionale. Se la domanda non riguarda YouTube, rispondi comunque in modo utile ma ricorda gentilmente che il tuo punto forte è l'analisi video YouTube.
 
@@ -1859,6 +2019,7 @@ def process_whatsapp_message(message: str, sender: str = None):
     handler(params, sender)
 
     log_message(sender, message, intent, params, outcome="handled")
+    update_user_memory(sender, message, intent, params)
 
     print(f"\n{'='*60}")
     print(f"✅ Done processing message")
@@ -1926,6 +2087,17 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps(entries, ensure_ascii=False, indent=2).encode())
             return
 
+        if path.startswith("/user/"):
+            # Return user memory for a specific sender
+            user_sender = path.split("/user/")[1].strip("/")
+            if user_sender:
+                mem = load_user_memory(user_sender)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps(mem, ensure_ascii=False, indent=2).encode())
+                return
+
         # Default: health check
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -1986,7 +2158,7 @@ def start_server(port: int = None):
 
     server = HTTPServer(("0.0.0.0", port), WebhookHandler)
     print(f"\n🚀 SARAh, l'unclock intelligence — server running on port {port}")
-    print(f"   Version: 2026-03-29-v3 (validator-agent)")
+    print(f"   Version: 2026-03-31-v4 (multi-tenant-memory)")
     print(f"   Webhook URL: http://localhost:{port}/webhook")
     print(f"   Health check: http://localhost:{port}/health")
     print(f"\n   Waiting for WhatsApp messages...\n")
