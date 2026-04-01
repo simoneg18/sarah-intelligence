@@ -37,6 +37,10 @@ WA_PHONE_NUMBER_ID = os.environ.get("WA_PHONE_NUMBER_ID", "")
 WA_ACCESS_TOKEN = os.environ.get("WA_ACCESS_TOKEN", "")
 WA_API_BASE = f"https://graph.facebook.com/v18.0/{WA_PHONE_NUMBER_ID}"
 
+# ElevenLabs TTS config
+ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
+ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "nPczCjzI2devNBz1zQrb")  # Brian - Deep, Resonant and Comforting
+
 # Known creators mapping — extend as needed
 KNOWN_CREATORS = {
     "chase": "https://www.youtube.com/@Chase-H-AI",
@@ -1035,8 +1039,46 @@ def extract_voice_script(full_text: str) -> Optional[str]:
     return full_text.strip()
 
 
-def generate_audio(text: str, output_path: str, voice: str = "it-IT-DiegoNeural") -> bool:
-    """Generate OGG Opus audio from text using Edge TTS."""
+def generate_audio_elevenlabs(text: str, output_path: str) -> bool:
+    """Generate OGG Opus audio from text using ElevenLabs API."""
+    try:
+        mp3_path = output_path.replace(".ogg", ".mp3")
+        resp = requests.post(
+            f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}",
+            headers={
+                "xi-api-key": ELEVENLABS_API_KEY,
+                "Content-Type": "application/json",
+            },
+            json={
+                "text": text,
+                "model_id": "eleven_multilingual_v2",
+                "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+            },
+            timeout=120,
+        )
+        if resp.status_code != 200:
+            print(f"  ⚠ ElevenLabs API error: {resp.status_code} {resp.text[:200]}")
+            return False
+        with open(mp3_path, "wb") as f:
+            f.write(resp.content)
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-i", mp3_path, "-c:a", "libopus", "-b:a", "64k", "-ac", "1", output_path],
+            capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode != 0:
+            print(f"  ⚠ ffmpeg error: {result.stderr[:200]}")
+            return False
+        Path(mp3_path).unlink(missing_ok=True)
+        size_kb = Path(output_path).stat().st_size / 1024
+        print(f"  🔊 Audio generato (ElevenLabs): {output_path} ({size_kb:.0f} KB)")
+        return True
+    except Exception as e:
+        print(f"  ⚠ ElevenLabs audio generation failed: {e}")
+        return False
+
+
+def generate_audio_edge_tts(text: str, output_path: str, voice: str = "it-IT-DiegoNeural") -> bool:
+    """Generate OGG Opus audio from text using Edge TTS (fallback)."""
     async def _generate():
         communicate = edge_tts.Communicate(text, voice)
         mp3_path = output_path.replace(".ogg", ".mp3")
@@ -1054,11 +1096,21 @@ def generate_audio(text: str, output_path: str, voice: str = "it-IT-DiegoNeural"
             return False
         Path(mp3_path).unlink(missing_ok=True)
         size_kb = Path(output_path).stat().st_size / 1024
-        print(f"  🔊 Audio generato: {output_path} ({size_kb:.0f} KB)")
+        print(f"  🔊 Audio generato (edge-tts): {output_path} ({size_kb:.0f} KB)")
         return True
     except Exception as e:
-        print(f"  ⚠ Audio generation failed: {e}")
+        print(f"  ⚠ Edge TTS audio generation failed: {e}")
         return False
+
+
+def generate_audio(text: str, output_path: str, voice: str = "it-IT-DiegoNeural") -> bool:
+    """Generate OGG Opus audio — ElevenLabs primary, edge-tts fallback."""
+    if ELEVENLABS_API_KEY:
+        result = generate_audio_elevenlabs(text, output_path)
+        if result:
+            return True
+        print("  ⚠ ElevenLabs failed, falling back to edge-tts...")
+    return generate_audio_edge_tts(text, output_path, voice)
 
 
 # ---------------------------------------------------------------------------
@@ -2152,7 +2204,7 @@ def start_server(port: int = None):
 
     server = HTTPServer(("0.0.0.0", port), WebhookHandler)
     print(f"\n🚀 SARAh, l'unclock intelligence — server running on port {port}")
-    print(f"   Version: 2026-03-31-v4 (multi-tenant-memory)")
+    print(f"   Version: 2026-04-01-v5 (elevenlabs-voice)")
     print(f"   Webhook URL: http://localhost:{port}/webhook")
     print(f"   Health check: http://localhost:{port}/health")
     print(f"\n   Waiting for WhatsApp messages...\n")
