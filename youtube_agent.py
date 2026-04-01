@@ -425,10 +425,13 @@ def parse_intent(message: str) -> dict:
 # YouTube helpers
 # ---------------------------------------------------------------------------
 
+YTDLP = ["yt-dlp", "--js-runtimes", "nodejs"]
+
+
 def get_channel_videos(channel_url: str, max_videos: int = 50) -> list[VideoInfo]:
     """Use yt-dlp to list videos from a channel."""
     cmd = [
-        "yt-dlp",
+        *YTDLP,
         "--flat-playlist",
         "--dump-json",
         "--no-download",
@@ -484,7 +487,7 @@ def search_youtube(query: str, max_results: int = 10, upload_date: str = None, p
         search_url = f"https://www.youtube.com/results?search_query={quote_plus(query)}&sp={sp}"
         fetch_count = max_results * 3  # fetch extra to have enough after metadata enrichment
         cmd = [
-            "yt-dlp",
+            *YTDLP,
             "--flat-playlist",
             "--dump-json",
             "--no-download",
@@ -497,7 +500,7 @@ def search_youtube(query: str, max_results: int = 10, upload_date: str = None, p
         fetch_count = max_results * 5 if upload_date else max_results
         search_str = f"ytsearch{fetch_count}:{query}"
         cmd = [
-            "yt-dlp",
+            *YTDLP,
             "--flat-playlist",
             "--dump-json",
             "--no-download",
@@ -536,7 +539,7 @@ def search_youtube(query: str, max_results: int = 10, upload_date: str = None, p
     fetch_errors = 0
     for vid_id in video_ids:
         url = f"https://www.youtube.com/watch?v={vid_id}"
-        cmd2 = ["yt-dlp", "--dump-json", "--no-download", url]
+        cmd2 = [*YTDLP, "--dump-json", "--no-download", url]
         try:
             result2 = subprocess.run(cmd2, capture_output=True, text=True, timeout=60)
             if result2.returncode != 0:
@@ -582,7 +585,7 @@ def search_youtube(query: str, max_results: int = 10, upload_date: str = None, p
 
 def get_video_info(url: str) -> Optional[VideoInfo]:
     """Get info for a single video URL."""
-    cmd = ["yt-dlp", "--dump-json", "--no-download", url]
+    cmd = [*YTDLP, "--dump-json", "--no-download", url]
     print(f"  🔍 yt-dlp fetching: {url}")
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
@@ -798,7 +801,7 @@ def resolve_creator(name: str) -> Optional[str]:
     # Fallback: try as @handle directly (many creators use their name as handle)
     test_url = f"https://www.youtube.com/@{key.replace(' ', '')}"
     try:
-        cmd = ["yt-dlp", "--flat-playlist", "--dump-json", "--no-download", "--playlist-end", "1", f"{test_url}/videos"]
+        cmd = [*YTDLP, "--flat-playlist", "--dump-json", "--no-download", "--playlist-end", "1", f"{test_url}/videos"]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
         if result.returncode == 0 and result.stdout.strip():
             # Found! Add to known creators for future use
