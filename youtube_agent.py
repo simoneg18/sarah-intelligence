@@ -425,7 +425,7 @@ def parse_intent(message: str) -> dict:
 # YouTube helpers
 # ---------------------------------------------------------------------------
 
-YTDLP = ["yt-dlp", "--js-runtimes", "nodejs"]
+YTDLP = ["yt-dlp", "--js-runtimes", "node"]
 
 
 def get_channel_videos(channel_url: str, max_videos: int = 50) -> list[VideoInfo]:
