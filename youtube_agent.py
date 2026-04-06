@@ -164,6 +164,98 @@ def _save_learned_error(user_message: str, action: str, params: dict, error_type
         f.write(json.dumps(errors, ensure_ascii=False, indent=2))
     print(f"  💾 Error pattern saved: {error_type} — {error_detail[:80]}")
 
+
+# ---------------------------------------------------------------------------
+# Behavior learning — SARAh learns routing rules from mistakes
+# ---------------------------------------------------------------------------
+
+LEARNED_BEHAVIORS_FILE = os.path.join(OUTPUT_DIR, "learned_behaviors.json")
+
+
+def _load_learned_behaviors() -> list:
+    """Load learned routing behaviors."""
+    try:
+        with open(LEARNED_BEHAVIORS_FILE, "r", encoding="utf-8") as f:
+            return json.loads(f.read())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def _save_learned_behavior(rule: str, source_message: str, correct_action: str, correct_params: dict):
+    """Save a new behavior rule learned from a mistake."""
+    behaviors = _load_learned_behaviors()
+    # Avoid near-duplicate rules
+    for b in behaviors:
+        if b.get("rule", "").lower() == rule.lower():
+            return
+    behaviors.append({
+        "ts": datetime.now().isoformat(),
+        "rule": rule,
+        "source_message": source_message[:200],
+        "correct_action": correct_action,
+        "correct_params": {k: v for k, v in correct_params.items() if not k.startswith("_")},
+    })
+    # Keep last 50 behaviors
+    behaviors = behaviors[-50:]
+    os.makedirs(os.path.dirname(LEARNED_BEHAVIORS_FILE), exist_ok=True)
+    with open(LEARNED_BEHAVIORS_FILE, "w", encoding="utf-8") as f:
+        f.write(json.dumps(behaviors, ensure_ascii=False, indent=2))
+    print(f"  🧠 New behavior learned: {rule[:100]}")
+
+
+def _analyze_and_learn(user_message: str, wrong_action: str, context: str = ""):
+    """Use Claude to analyze a routing mistake and generate a behavior rule.
+    Called when SARAh suspects she misrouted a YouTube request."""
+    client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=512,
+        system="""Sei un analista di errori per SARAh, un sistema che trascrive e analizza video YouTube.
+SARAh ha ricevuto un messaggio che riguardava YouTube/video ma lo ha classificato in modo sbagliato.
+
+Il tuo compito:
+1. Analizzare PERCHÉ il messaggio è stato frainteso
+2. Determinare quale azione corretta avrebbe dovuto eseguire
+3. Scrivere una REGOLA chiara che eviti lo stesso errore in futuro
+
+Le azioni possibili sono:
+- channel_analysis: analisi video di un creator (params: creator, n)
+- single_video: analisi video da URL (params: url, focus)
+- topic_search: ricerca video per argomento (params: topic, country, period, n, language)
+- multi_creator: confronto tra creator (params: creators, topic, n)
+- news_search: novità su un tema (params: topic, period, n)
+- follow_up: approfondimento su analisi precedente (params: question)
+- scheduling: programmazione briefing (params: creator, topic, frequency, schedule_time)
+
+Rispondi ESCLUSIVAMENTE con JSON valido:
+{
+  "rule": "Quando l'utente dice/chiede X, è una [azione] perché [motivo]",
+  "correct_action": "nome_azione",
+  "correct_params": {"param1": "valore_esempio"}
+}""",
+        messages=[{"role": "user", "content": f"Messaggio utente: \"{user_message}\"\nAzione sbagliata scelta: {wrong_action}\nContesto aggiuntivo: {context}"}],
+    )
+
+    text = response.content[0].text.strip()
+    try:
+        if "```" in text:
+            match = re.search(r'```(?:json)?\s*(.*?)\s*```', text, re.DOTALL)
+            if match:
+                text = match.group(1)
+        result = json.loads(text)
+        _save_learned_behavior(
+            rule=result.get("rule", ""),
+            source_message=user_message,
+            correct_action=result.get("correct_action", ""),
+            correct_params=result.get("correct_params", {}),
+        )
+        return result
+    except (json.JSONDecodeError, Exception) as e:
+        print(f"  ⚠ Behavior analysis failed: {e}")
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Per-user persistent memory (multi-tenant)
 # ---------------------------------------------------------------------------
@@ -504,6 +596,14 @@ def _build_learning_context(sender: str) -> str:
         for e in recent_e:
             error_notes.append(f"  {e['error_type']}: {e['error_detail'][:60]}")
         parts.append("Errori recenti da evitare:\n" + "\n".join(error_notes))
+
+    # Learned behavior rules — CRITICAL: these are routing rules learned from past mistakes
+    learned_behaviors = _load_learned_behaviors()
+    if learned_behaviors:
+        rules = []
+        for b in learned_behaviors[-10:]:  # Last 10 rules
+            rules.append(f"  ✓ {b['rule']}")
+        parts.append("REGOLE APPRESE (segui SEMPRE queste regole, hanno priorità):\n" + "\n".join(rules))
 
     if not parts:
         return ""
@@ -1862,8 +1962,79 @@ def handle_news_search(params: dict, sender: str):
         _save_learned_query(params.get("_original_message", ""), "news_search", params, len(analyses))
 
 
+def _self_check_routing(user_message: str, sender: str) -> dict | None:
+    """Double-check: is this message actually about YouTube?
+    Returns correction dict if yes, None if the not_youtube classification was correct."""
+    client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+
+    # Build context from user memory
+    memory = load_user_memory(sender)
+    context_parts = []
+    fav = memory.get("favorite_creators", [])
+    if fav:
+        context_parts.append(f"Creator preferiti dell'utente: {', '.join(fav[:5])}")
+    topics = memory.get("topics_of_interest", [])
+    if topics:
+        context_parts.append(f"Topic di interesse: {', '.join(topics[:5])}")
+    recent = memory.get("recent_interactions", [])
+    if recent:
+        last = recent[-3:]
+        for r in last:
+            context_parts.append(f"  Recente: ({r.get('intent', '?')}) {r.get('message', '')[:60]}")
+    user_context = "\n".join(context_parts) if context_parts else "Nessun contesto disponibile."
+
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=400,
+        system=f"""Sei un verificatore per SARAh, un sistema che trascrive e analizza video YouTube.
+
+Un messaggio è stato classificato come "NON riguardante YouTube". Il tuo compito è VERIFICARE se questa classificazione è corretta.
+
+Considera che SARAh può:
+- Analizzare video di un creator (channel_analysis)
+- Analizzare un video da URL (single_video)
+- Cercare video su un argomento (topic_search)
+- Confrontare creator (multi_creator)
+- Cercare novità su un tema (news_search)
+- Approfondire analisi precedenti (follow_up)
+- Programmare briefing (scheduling)
+
+CONTESTO UTENTE:
+{user_context}
+
+IMPORTANTE: Se il messaggio potrebbe IN QUALCHE MODO riferirsi a video YouTube (anche in modo implicito, es. "cosa dice X su Y" dove X potrebbe essere un creator), allora è stato classificato MALE.
+
+Se il messaggio parla di qualcosa che ha a che fare con video, creator, analisi di contenuti video, trascrizioni → è stato classificato MALE.
+Se è davvero un saluto, una domanda generica, o qualcosa che non c'entra con video → classificazione CORRETTA.
+
+Rispondi ESCLUSIVAMENTE con JSON:
+- Se classificazione CORRETTA: {{"is_youtube": false}}
+- Se classificazione SBAGLIATA: {{"is_youtube": true, "correct_action": "nome_azione", "correct_params": {{...}}, "reason": "perché è YouTube"}}""",
+        messages=[{"role": "user", "content": f"Messaggio: \"{user_message}\""}],
+    )
+
+    text = response.content[0].text.strip()
+    try:
+        if "```" in text:
+            match = re.search(r'```(?:json)?\s*(.*?)\s*```', text, re.DOTALL)
+            if match:
+                text = match.group(1)
+        result = json.loads(text)
+        if result.get("is_youtube"):
+            print(f"  🔍 Self-check: message IS about YouTube! Reason: {result.get('reason', '?')}")
+            # Learn this behavior for the future
+            _analyze_and_learn(user_message, "not_youtube", result.get("reason", ""))
+            return result
+        else:
+            print(f"  ✓ Self-check confirmed: not YouTube")
+            return None
+    except (json.JSONDecodeError, Exception) as e:
+        print(f"  ⚠ Self-check failed: {e}")
+        return None
+
+
 def handle_not_youtube(params: dict, sender: str):
-    """Non-YouTube message: polite decline with examples, or greeting."""
+    """Non-YouTube message: but first, double-check if it's actually a YouTube request we missed."""
     raw_message = params.get("raw_message", params.get("_original_message", ""))
     is_greeting = params.get("is_greeting", False)
 
@@ -1880,6 +2051,24 @@ def handle_not_youtube(params: dict, sender: str):
         user_name = detected_name
 
     greeting_name = f" {user_name}" if user_name else ""
+
+    # --- Self-check: did the router make a mistake? ---
+    # Skip self-check for obvious greetings
+    if not is_greeting and raw_message and len(raw_message) > 5:
+        correction = _self_check_routing(raw_message, sender)
+        if correction:
+            # Router was wrong! Learn the rule and execute the correct action
+            correct_action = correction.get("correct_action", "")
+            correct_params = correction.get("correct_params", {})
+            correct_params["_original_message"] = raw_message
+            print(f"  🔄 Self-correction: not_youtube → {correct_action}")
+
+            handler = ACTION_HANDLERS.get(correct_action)
+            if handler:
+                handler(correct_params, sender)
+                return
+
+    # --- No correction needed, proceed with normal not_youtube handling ---
 
     if is_greeting:
         # Greeting — respond warmly + show capabilities
@@ -2001,11 +2190,18 @@ Sii concisa (max 4-5 frasi). Non usare markdown pesante.""",
     # Save error pattern from feedback for future learning
     last_action = ""
     last_params = {}
+    last_message = ""
     if recent_logs:
         last_log = recent_logs[-1]
         last_action = last_log.get("intent", "unknown")
         last_params = last_log.get("params", {})
+        last_message = last_log.get("message", "")
     _save_learned_error(complaint, last_action, last_params, "user_complaint", complaint[:200])
+
+    # Learn from the mistake: if the previous message was routed wrong, create a behavior rule
+    if last_message and last_action:
+        print(f"  🧠 Analyzing routing mistake for behavior learning...")
+        _analyze_and_learn(last_message, last_action, f"L'utente si è lamentato: {complaint[:150]}")
 
 
 # Action routing
