@@ -39,7 +39,7 @@ WA_API_BASE = f"https://graph.facebook.com/v18.0/{WA_PHONE_NUMBER_ID}"
 
 # ElevenLabs TTS config
 ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
-ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "nPczCjzI2devNBz1zQrb")  # Brian - Deep, Resonant and Comforting
+ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")  # Sarah - Mature, Reassuring, Confident
 
 # Known creators mapping — extend as needed
 _DEFAULT_CREATORS = {
