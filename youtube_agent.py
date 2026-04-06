@@ -524,22 +524,31 @@ AZIONI POSSIBILI:
    Params: creator (nome), topic (opzionale), n (default 3), frequency ("once"/"daily"/"weekly"/"monthly"),
            schedule_time (HH:MM, default "08:00"), schedule_date (YYYY-MM-DD, opzionale), day (opzionale), keywords (opzionale)
 
-8. feedback — L'utente segnala un PROBLEMA o ERRORE di SARAh.
-   Params: complaint (descrizione), raw_message (messaggio originale)
+8. list_schedules — L'utente vuole vedere i briefing programmati.
+   Params: raw_message (messaggio originale)
+   Esempi: "che briefing ho programmato?", "ne ho già programmato uno?", "quali task ho attivi?", "cosa mi hai programmato?"
 
-9. not_youtube — Il messaggio NON riguarda video YouTube. Include saluti puri, domande generiche, conversazione.
-   Params: raw_message (messaggio originale), is_greeting (boolean — true se è un saluto/presentazione)
+9. cancel_schedule — L'utente vuole cancellare un briefing programmato.
+   Params: creator (nome creator da cancellare, opzionale), schedule_time (orario da cancellare, opzionale), cancel_all (boolean, true se vuole cancellare tutti)
+   Esempi: "cancella il briefing delle 8", "elimina il task di enkk", "cancella tutti i briefing programmati"
+
+10. feedback — L'utente segnala un PROBLEMA o ERRORE di SARAh.
+    Params: complaint (descrizione), raw_message (messaggio originale)
+
+11. not_youtube — Il messaggio NON riguarda video YouTube. Include saluti puri, domande generiche, conversazione.
+    Params: raw_message (messaggio originale), is_greeting (boolean — true se è un saluto/presentazione)
 
 REGOLE:
 - Se il messaggio riguarda video, creator, trascrizioni, riassunti video, analisi video, YouTube → scegli l'azione YouTube appropriata (1-7).
+- Se l'utente chiede info sui briefing programmati → list_schedules.
+- Se l'utente vuole cancellare/eliminare un briefing programmato → cancel_schedule.
+- Se l'utente dice "cancella X e crea Y" → usa scheduling con i nuovi parametri (il handler gestirà la cancellazione).
 - Se l'utente si LAMENTA di qualcosa che SARAh ha fatto male → feedback.
 - TUTTO il resto (saluti, domande non-YouTube, conversazione) → not_youtube.
 - In caso di dubbio, se c'è QUALSIASI riferimento a video/YouTube → trattalo come richiesta YouTube.
 - "topic_search" e "news_search" sono simili: usa news_search quando l'utente dice "novità"/"news"/"ultimi", topic_search per il resto.
-- DOMANDE IPOTETICHE: Se l'utente CHIEDE se SARAh è in grado di fare qualcosa ("sapresti...", "potresti...", "sei in grado di...", "e se ti chiedessi...", "lo sapresti fare?", "riesci a...") → NON eseguire l'azione. Classifica come not_youtube con is_greeting=false e is_capability_question=true. SARAh deve RISPONDERE alla domanda, non eseguire il comando.
-  Esempi: "e se ti chiedessi di mandarmi ogni giorno il riassunto?" → not_youtube (domanda ipotetica, NON scheduling)
-          "saresti in grado di riassumere un video?" → not_youtube (domanda ipotetica, NON single_video)
-          "mandami il riassunto ogni giorno alle 8" → scheduling (comando diretto, eseguire)
+- DOMANDE IPOTETICHE: Se l'utente CHIEDE se SARAh è in grado di fare qualcosa ("sapresti...", "potresti...", "sei in grado di...", "e se ti chiedessi...", "lo sapresti fare?", "riesci a...") → NON eseguire l'azione. Classifica come not_youtube con is_greeting=false e is_capability_question=true.
+- CONTESTO CONVERSAZIONALE: Se il messaggio è corto e ambiguo ("di chi?", "quale?", "sì quello"), usa il contesto delle interazioni recenti per capire a cosa si riferisce. Se si riferisce a qualcosa legato a YouTube/scheduling/task, classifica di conseguenza — NON come not_youtube.
 
 Rispondi ESCLUSIVAMENTE con JSON valido:
 {"action": "nome_azione", "params": {...}, "confidence": 0.0-1.0}"""
@@ -563,16 +572,23 @@ def _build_learning_context(sender: str) -> str:
     if topics:
         parts.append(f"Topic di interesse: {', '.join(topics[:5])}")
 
-    # Recent interactions — help disambiguate short messages
+    # Recent interactions — CRITICAL for disambiguating short messages like "di chi?", "quale?"
     recent = memory.get("recent_interactions", [])
     if recent:
-        last_3 = recent[-3:]
+        last_5 = recent[-5:]
         history = []
-        for r in last_3:
-            msg = r.get("message", "")[:80]
+        for r in last_5:
+            msg = r.get("message", "")[:120]
             action = r.get("intent", "?")
-            history.append(f"  ({action}) {msg}")
-        parts.append("Ultime interazioni:\n" + "\n".join(history))
+            creator = r.get("creator", "")
+            topic = r.get("topic", "")
+            context_note = ""
+            if creator:
+                context_note += f" [creator: {creator}]"
+            if topic:
+                context_note += f" [topic: {topic}]"
+            history.append(f"  ({action}) \"{msg}\"{context_note}")
+        parts.append("CONVERSAZIONE RECENTE (usa per capire messaggi ambigui):\n" + "\n".join(history))
 
     # Known creators list — so router knows what names are valid
     known = list(KNOWN_CREATORS.keys())
@@ -616,7 +632,7 @@ def _build_learning_context(sender: str) -> str:
 
 def route_message(message: str, sender: str = None) -> dict:
     """Use Claude to route a WhatsApp message: YouTube action or not_youtube.
-    Injects user context and learned patterns for smarter routing."""
+    Uses Haiku for speed, injects user context and learned patterns."""
     client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
 
     # Build dynamic context from learning
@@ -624,7 +640,7 @@ def route_message(message: str, sender: str = None) -> dict:
     system_prompt = ROUTER_SYSTEM_PROMPT + learning_context
 
     response = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-haiku-4-20250414",
         max_tokens=512,
         system=system_prompt,
         messages=[{"role": "user", "content": message}],
@@ -1919,12 +1935,97 @@ def handle_scheduling(params: dict, sender: str):
         freq_map = {"daily": "ogni giorno", "weekly": f"ogni {day or 'settimana'}", "monthly": "ogni mese"}
         freq_text = f"{freq_map.get(frequency, frequency)} alle {schedule_time}, a partire dal {time_str}"
 
+    # If cancel_existing is set, cancel matching schedules first
+    cancel_existing = params.get("cancel_existing", False)
+    if cancel_existing:
+        _cancel_user_schedules(sender)
+
     send_whatsapp_text(sender,
         f"✅ *Programmato!*\n\n"
         f"📺 {n} video di {subject}\n"
         f"📅 {freq_text}\n\n"
         f"Riceverai il briefing audio automaticamente! 🎙️")
     print(f"  📅 Schedule saved: {task['id']} — fires at {target.isoformat()} (in {delay:.0f}s)")
+
+
+def _cancel_user_schedules(sender: str, creator: str = None, schedule_time: str = None) -> int:
+    """Cancel matching schedules for a user. Returns count of cancelled schedules."""
+    schedules_file = Path(OUTPUT_DIR) / "schedules.json"
+    if not schedules_file.exists():
+        return 0
+    try:
+        schedules = json.loads(schedules_file.read_text())
+    except json.JSONDecodeError:
+        return 0
+
+    cancelled = 0
+    for s in schedules:
+        if s.get("recipient") != sender or not s.get("active", False):
+            continue
+        # Match by creator and/or time if specified
+        if creator and s.get("creator", "").lower() != creator.lower():
+            continue
+        if schedule_time and s.get("schedule_time", "") != schedule_time:
+            continue
+        s["active"] = False
+        cancelled += 1
+
+    schedules_file.write_text(json.dumps(schedules, indent=2, ensure_ascii=False))
+    print(f"  🗑️ Cancelled {cancelled} schedule(s) for {sender}")
+    return cancelled
+
+
+def handle_list_schedules(params: dict, sender: str):
+    """Show the user their active scheduled briefings."""
+    schedules_file = Path(OUTPUT_DIR) / "schedules.json"
+    schedules = []
+    if schedules_file.exists():
+        try:
+            schedules = json.loads(schedules_file.read_text())
+        except json.JSONDecodeError:
+            pass
+
+    user_schedules = [s for s in schedules if s.get("recipient") == sender and s.get("active", False)]
+
+    if not user_schedules:
+        send_whatsapp_text(sender, "📅 Non hai nessun briefing programmato al momento.\n\nVuoi programmarne uno? Dimmi ad esempio:\n_\"mandami ogni giorno alle 8 il riassunto di enkk\"_")
+        return
+
+    lines = ["📅 *I tuoi briefing programmati:*\n"]
+    for i, s in enumerate(user_schedules, 1):
+        subject = s.get("creator", "") or s.get("topic", "?")
+        freq = s.get("frequency", "once")
+        time = s.get("schedule_time", "?")
+        n = s.get("n", 3)
+
+        freq_map = {"once": "una volta", "daily": "ogni giorno", "weekly": "ogni settimana", "monthly": "ogni mese"}
+        freq_text = freq_map.get(freq, freq)
+
+        lines.append(f"{i}. *{subject}* — {n} video")
+        lines.append(f"   🕐 {freq_text} alle {time}")
+        lines.append("")
+
+    lines.append("Per cancellarne uno dimmi: _\"cancella il briefing di [creator]\"_")
+    send_whatsapp_text(sender, "\n".join(lines))
+
+
+def handle_cancel_schedule(params: dict, sender: str):
+    """Cancel one or more scheduled briefings."""
+    creator = params.get("creator", "")
+    schedule_time = params.get("schedule_time", "")
+    cancel_all = params.get("cancel_all", False)
+
+    if cancel_all:
+        cancelled = _cancel_user_schedules(sender)
+    elif creator or schedule_time:
+        cancelled = _cancel_user_schedules(sender, creator=creator, schedule_time=schedule_time)
+    else:
+        cancelled = _cancel_user_schedules(sender)
+
+    if cancelled > 0:
+        send_whatsapp_text(sender, f"🗑️ Fatto! Ho cancellato {cancelled} briefing programmato/i.")
+    else:
+        send_whatsapp_text(sender, "⚠️ Non ho trovato briefing attivi da cancellare.")
 
 
 def handle_news_search(params: dict, sender: str):
@@ -1988,7 +2089,7 @@ def _self_check_routing(user_message: str, sender: str) -> dict | None:
     user_context = "\n".join(context_parts) if context_parts else "Nessun contesto disponibile."
 
     response = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-haiku-4-20250414",
         max_tokens=400,
         system=f"""Sei un verificatore per SARAh, un sistema che trascrive e analizza video YouTube.
 
@@ -2253,6 +2354,8 @@ ACTION_HANDLERS = {
     "multi_creator": handle_multi_creator,
     "follow_up": handle_follow_up_intent,
     "scheduling": handle_scheduling,
+    "list_schedules": handle_list_schedules,
+    "cancel_schedule": handle_cancel_schedule,
     "news_search": handle_news_search,
     "feedback": handle_feedback,
     "not_youtube": handle_not_youtube,
