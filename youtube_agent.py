@@ -2349,6 +2349,90 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 self.wfile.write(json.dumps(mem, ensure_ascii=False, indent=2).encode())
                 return
 
+        if path == "/errors":
+            # Return learned errors
+            qs = parse_qs(parsed.query)
+            n = int(qs.get("n", ["50"])[0])
+            errors = _load_learned_errors()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(errors[-n:], ensure_ascii=False, indent=2).encode())
+            return
+
+        if path == "/behaviors":
+            # Return learned behavior rules
+            behaviors = _load_learned_behaviors()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(behaviors, ensure_ascii=False, indent=2).encode())
+            return
+
+        if path == "/queries":
+            # Return learned successful queries
+            qs = parse_qs(parsed.query)
+            n = int(qs.get("n", ["50"])[0])
+            queries = _load_learned_queries()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(queries[-n:], ensure_ascii=False, indent=2).encode())
+            return
+
+        if path == "/creators":
+            # Return all known creators (default + learned)
+            learned = _load_learned_creators()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "default": dict(_DEFAULT_CREATORS),
+                "learned": learned,
+                "total": len(KNOWN_CREATORS),
+            }, ensure_ascii=False, indent=2).encode())
+            return
+
+        if path == "/stats":
+            # Return full learning stats summary
+            errors = _load_learned_errors()
+            behaviors = _load_learned_behaviors()
+            queries = _load_learned_queries()
+            learned_creators = _load_learned_creators()
+
+            # Count unique users
+            users_dir = Path(USERS_DIR)
+            user_count = len(list(users_dir.glob("*/memory.json"))) if users_dir.exists() else 0
+
+            # Message count
+            msg_count = 0
+            try:
+                with open(MESSAGE_LOG, "r", encoding="utf-8") as f:
+                    msg_count = sum(1 for _ in f)
+            except FileNotFoundError:
+                pass
+
+            stats = {
+                "service": "SARAh, l'unclock intelligence",
+                "version": "2026-04-06-v6 (youtube-first-router + behavior-learning)",
+                "users": user_count,
+                "total_messages": msg_count,
+                "learning": {
+                    "errors": len(errors),
+                    "behaviors": len(behaviors),
+                    "successful_queries": len(queries),
+                    "learned_creators": len(learned_creators),
+                    "default_creators": len(_DEFAULT_CREATORS),
+                },
+                "recent_errors": errors[-5:] if errors else [],
+                "behavior_rules": [b["rule"] for b in behaviors] if behaviors else [],
+            }
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(stats, ensure_ascii=False, indent=2).encode())
+            return
+
         # Default: health check
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
