@@ -1347,8 +1347,9 @@ def generate_audio_edge_tts(text: str, output_path: str, voice: str = "it-IT-Die
         return False
 
 
-def generate_audio(text: str, output_path: str, voice: str = "it-IT-DiegoNeural") -> bool:
-    """Generate OGG Opus audio — ElevenLabs primary, edge-tts fallback."""
+def generate_audio(text: str, output_path: str, voice: str = "it-IT-ElsaNeural") -> bool:
+    """Generate OGG Opus audio — ElevenLabs primary, edge-tts fallback.
+    Default voice: Elsa (Italian, female, natural)."""
     if ELEVENLABS_API_KEY:
         result = generate_audio_elevenlabs(text, output_path)
         if result:
