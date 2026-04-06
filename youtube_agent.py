@@ -536,6 +536,10 @@ REGOLE:
 - TUTTO il resto (saluti, domande non-YouTube, conversazione) → not_youtube.
 - In caso di dubbio, se c'è QUALSIASI riferimento a video/YouTube → trattalo come richiesta YouTube.
 - "topic_search" e "news_search" sono simili: usa news_search quando l'utente dice "novità"/"news"/"ultimi", topic_search per il resto.
+- DOMANDE IPOTETICHE: Se l'utente CHIEDE se SARAh è in grado di fare qualcosa ("sapresti...", "potresti...", "sei in grado di...", "e se ti chiedessi...", "lo sapresti fare?", "riesci a...") → NON eseguire l'azione. Classifica come not_youtube con is_greeting=false e is_capability_question=true. SARAh deve RISPONDERE alla domanda, non eseguire il comando.
+  Esempi: "e se ti chiedessi di mandarmi ogni giorno il riassunto?" → not_youtube (domanda ipotetica, NON scheduling)
+          "saresti in grado di riassumere un video?" → not_youtube (domanda ipotetica, NON single_video)
+          "mandami il riassunto ogni giorno alle 8" → scheduling (comando diretto, eseguire)
 
 Rispondi ESCLUSIVAMENTE con JSON valido:
 {"action": "nome_azione", "params": {...}, "confidence": 0.0-1.0}"""
@@ -2037,6 +2041,7 @@ def handle_not_youtube(params: dict, sender: str):
     """Non-YouTube message: but first, double-check if it's actually a YouTube request we missed."""
     raw_message = params.get("raw_message", params.get("_original_message", ""))
     is_greeting = params.get("is_greeting", False)
+    is_capability_question = params.get("is_capability_question", False)
 
     memory = load_user_memory(sender)
     user_name = memory.get("name", "")
@@ -2052,8 +2057,44 @@ def handle_not_youtube(params: dict, sender: str):
 
     greeting_name = f" {user_name}" if user_name else ""
 
+    # --- Capability question: user asking what SARAh can do ---
+    if is_capability_question:
+        print(f"  ❓ Capability question: \"{raw_message}\"")
+        client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+        name_instruction = f"\nL'utente si chiama {user_name}. Chiamalo per nome." if user_name else ""
+
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=400,
+            system=f"""Sei SARAh, l'unclock intelligence. Il tuo umore: {mood['mood']} {mood['emoji']}.{name_instruction}
+
+L'utente ti sta chiedendo SE sei in grado di fare qualcosa. NON eseguire l'azione — rispondi alla domanda.
+
+Le tue capacità:
+- Analizzare gli ultimi N video di un creator YouTube
+- Analizzare un video singolo da URL
+- Cercare video su qualsiasi argomento
+- Confrontare cosa dicono più creator su un tema
+- Cercare novità su un tema
+- Programmare briefing audio ricorrenti (giornalieri, settimanali, mensili)
+- Approfondire analisi già fatte
+
+Rispondi in modo entusiasta e breve (max 3-4 frasi):
+1. Conferma che sì, puoi farlo
+2. Spiega brevemente come
+3. Invita l'utente a chiederlo direttamente se vuole che tu lo faccia
+
+Sii simpatica e diretta. Non usare markdown pesante.""",
+            messages=[{"role": "user", "content": raw_message}],
+        )
+
+        reply = response.content[0].text.strip()
+        send_whatsapp_text(sender, reply)
+        print(f"  ❓ Capability reply: {reply[:100]}...")
+        return
+
     # --- Self-check: did the router make a mistake? ---
-    # Skip self-check for obvious greetings
+    # Skip self-check for obvious greetings and capability questions
     if not is_greeting and raw_message and len(raw_message) > 5:
         correction = _self_check_routing(raw_message, sender)
         if correction:
