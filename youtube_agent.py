@@ -313,112 +313,79 @@ class AgentResponse:
 # Intent Parsing
 # ---------------------------------------------------------------------------
 
-INTENT_SYSTEM_PROMPT = """Sei il parser di comandi per SARAh, l'unclock intelligence — un sistema che analizza video YouTube e produce briefing audio su WhatsApp.
+ROUTER_SYSTEM_PROMPT = """Sei il router di SARAh, l'unclock intelligence — un sistema che trascrive e analizza video YouTube e produce briefing audio su WhatsApp.
 
-Dato un messaggio in linguaggio naturale, identifica l'intent e i parametri.
+Il tuo compito: capire se il messaggio riguarda YouTube/video e determinare l'azione giusta.
 
-INTENTS DISPONIBILI:
+SARAh fa UNA cosa: trova video YouTube → li trascrive → li analizza → consegna un briefing.
+Qualsiasi richiesta che implichi cercare, analizzare, riassumere, trascrivere video YouTube è VALIDA.
 
-1. channel_analysis — L'utente vuole un riassunto degli ultimi N video di un creator specifico.
-   Params: creator (nome), n (numero video, default 5), keywords (lista filtri topic, opzionale)
-   Esempi: "ultimi 5 video di Chase", "cosa ha detto Cole Medin su n8n", "riassumimi gli ultimi 3 video di Liam Ottley"
+AZIONI POSSIBILI:
 
-2. single_video — L'utente manda un URL YouTube specifico da analizzare, eventualmente con istruzioni specifiche.
-   Params: url (URL del video), focus (opzionale: richiesta specifica dell'utente, es. "estrai i 5 punti chiave", "riassunto tecnico per manager", "elenca tool e costi")
-   Esempi: "analizza questo https://youtube.com/watch?v=abc123",
-           "https://youtube.com/watch?v=abc — Estrai i 5 punti chiave su come implementare la RAG",
-           "https://youtube.com/watch?v=abc — Fammi un riassunto tecnico ma comprensibile per un manager non-tech"
+1. channel_analysis — Analizzare video di un creator specifico.
+   Params: creator (nome), n (numero video, default 5), keywords (filtri topic, opzionale)
 
-3. topic_search — L'utente vuole scoprire chi parla di un certo topic, eventualmente filtrato per paese/periodo/lingua.
-   Params: topic (argomento), country (opzionale, codice paese es. "IT", "US", "UK", "ES", "DE", "FR"),
-           period (opzionale: "today", "week", "month"), n (numero video, default 5),
-           language (opzionale: "italiano", "english", "español", etc.)
-   NOTE: Se l'utente dice "in Italia", "YouTube Italia", "italiani" → country="IT".
-         Se dice "in inglese", "english" → language="english".
-         Se dice "ultimo mese"/"nell'ultimo mese" → period="month". "ultima settimana" → period="week". "oggi" → period="today".
-   Esempi: "chi parla di MCP servers?", "creator italiani che parlano di AI agents questa settimana",
-           "5 video più visti in Italia sull'AI nell'ultimo mese", "find English videos about Claude Code from this week",
-           "Trova i video più recenti che spiegano come usare l'AI per l'analisi predittiva nelle vendite",
-           "Cerca chi sta testando Grok-3 e quali sono i primi feedback sulla sua capacità di coding",
-           "Quali esperti stanno discutendo di AI Sovereign Clouds in Europa?",
-           "Trova video che parlano di Agentic Workflow applicati al Customer Success"
+2. single_video — Analizzare un video da URL.
+   Params: url (URL del video), focus (richiesta specifica, opzionale)
 
-4. multi_creator — L'utente vuole confrontare cosa dicono diversi creator su un topic.
+3. topic_search — Cercare video su un argomento.
+   Params: topic (argomento), country (codice paese, opzionale), period ("today"/"week"/"month", default "week"),
+           n (numero video, default 5), language (opzionale)
+
+4. multi_creator — Confrontare video di più creator su un tema.
    Params: creators (lista nomi), topic (argomento), n (video per creator, default 3)
-   Esempi: "confronta Chase e Cole Medin su Claude Code", "cosa dicono Chase, Liam e Cole su AI agents"
 
-5. follow_up — L'utente vuole approfondire qualcosa da un'analisi precedente (NON sta segnalando un errore).
-   Params: question (la domanda di approfondimento)
-   Esempi: "approfondisci il punto sugli MCP servers", "dimmi di più sul secondo video", "cosa intendeva Chase con..."
-   NOTA: Se l'utente si LAMENTA o dice che qualcosa non ha funzionato, NON è follow_up → è feedback.
+5. news_search — Novità/ultimi video su un tema.
+   Params: topic (argomento), period (default "week"), n (default 5)
 
-6. scheduling — L'utente vuole programmare un invio di video, sia one-shot che ricorrente.
-   Params: creator (nome), n (numero video, default 3), frequency ("once", "daily", "weekly", "monthly"),
-           schedule_time (orario HH:MM, default "08:00"), schedule_date (data YYYY-MM-DD per invii one-shot, opzionale),
-           day (opzionale: "monday", etc. per ricorrenti), keywords (opzionale), topic (opzionale, per ricerche per tema)
-   IMPORTANTE per frequency:
-   - Se l'utente dice "domani alle 8", "per domani mattina", "oggi pomeriggio" → frequency="once"
-   - Se dice "ogni lunedì", "ogni giorno", "settimanalmente" → frequency="weekly"/"daily"/"monthly"
-   - Se non specifica ripetizione, default a "once"
-   Esempi: "mandami gli ultimi 3 video di enkk domani alle 8" → frequency="once"
-           "aggiornami ogni lunedì sui video di Chase" → frequency="weekly"
-           "programmami un briefing su Cole Medin per domani mattina" → frequency="once"
-           "ogni venerdì mandami i video su AI agents" → frequency="weekly"
+6. follow_up — Approfondire qualcosa da un'analisi già fatta (NON un errore/lamentela).
+   Params: question (domanda)
 
-7. news_search — L'utente vuole le novità su un topic senza specificare un creator.
-   Params: topic (argomento), period ("today", "week", "month", default "week"), n (max video, default 5),
-           country (opzionale), language (opzionale)
-   Esempi: "novità su Claude Code", "cosa c'è di nuovo su AI agents questa settimana", "ultimi video su n8n"
+7. scheduling — Programmare invio automatico di briefing.
+   Params: creator (nome), topic (opzionale), n (default 3), frequency ("once"/"daily"/"weekly"/"monthly"),
+           schedule_time (HH:MM, default "08:00"), schedule_date (YYYY-MM-DD, opzionale), day (opzionale), keywords (opzionale)
 
-8. greeting — L'utente saluta SARAh o chiede come sta, o si presenta.
-   Params: name (nome dell'utente, se menzionato, opzionale)
-   Esempi: "ciao SARAh", "buongiorno", "come stai?", "hey", "ciao come va?", "buonasera SARAh"
+8. feedback — L'utente segnala un PROBLEMA o ERRORE di SARAh.
+   Params: complaint (descrizione), raw_message (messaggio originale)
 
-9. confirmation — L'utente conferma o rifiuta una richiesta precedente.
-   Params: confirmed (boolean — true se conferma, false se rifiuta)
-   Esempi: "sì", "ok", "procedi", "vai", "confermo", "no", "annulla", "stop", "non quelli"
+9. not_youtube — Il messaggio NON riguarda video YouTube. Include saluti puri, domande generiche, conversazione.
+   Params: raw_message (messaggio originale), is_greeting (boolean — true se è un saluto/presentazione)
 
-10. feedback — L'utente segnala un PROBLEMA, un ERRORE, o si LAMENTA di qualcosa che SARAh ha fatto male.
-   Params: complaint (descrizione del problema), raw_message (messaggio originale)
-   PRIORITÀ ALTA: Se il messaggio contiene lamentele, critiche, o segnalazioni di errore → SEMPRE feedback, MAI follow_up.
-   Parole chiave: "sbagliato", "non funziona", "errore", "non va", "non hai trovato", "hai capito male", "non era quello",
-                  "non è giusto", "roba vecchia", "non arriva", "non quelli", "hai sbagliato", "problema"
-   Esempi: "non hai trovato i video", "hai sbagliato", "il briefing non arriva", "non era quello che volevo",
-           "non funziona", "il video non è quello giusto", "mi hai mandato roba vecchia",
-           "hai capito male", "non era questa la mia richiesta", "errore", "non va",
-           "non hai trovato i video che ti avevo chiesto, hai sbagliato"
+REGOLE:
+- Se il messaggio riguarda video, creator, trascrizioni, riassunti video, analisi video, YouTube → scegli l'azione YouTube appropriata (1-7).
+- Se l'utente si LAMENTA di qualcosa che SARAh ha fatto male → feedback.
+- TUTTO il resto (saluti, domande non-YouTube, conversazione) → not_youtube.
+- In caso di dubbio, se c'è QUALSIASI riferimento a video/YouTube → trattalo come richiesta YouTube.
+- "topic_search" e "news_search" sono simili: usa news_search quando l'utente dice "novità"/"news"/"ultimi", topic_search per il resto.
 
-Rispondi ESCLUSIVAMENTE con un JSON valido, nient'altro:
-{"intent": "nome_intent", "params": {...}, "confidence": 0.0-1.0}
-
-IMPORTANTE: Se il messaggio sembra una domanda generica, una richiesta di aiuto, una conversazione, o qualsiasi cosa che non rientra negli intent sopra, usa:
-{"intent": "unknown", "params": {"raw_message": "il messaggio originale"}, "confidence": 0.0}
-
-NON usare unknown se il messaggio riguarda video YouTube, anche se formulato in modo insolito — prova a mapparlo all'intent più vicino."""
+Rispondi ESCLUSIVAMENTE con JSON valido:
+{"action": "nome_azione", "params": {...}, "confidence": 0.0-1.0}"""
 
 
-def parse_intent(message: str) -> dict:
-    """Use Claude to parse a WhatsApp message into a structured intent."""
+def route_message(message: str) -> dict:
+    """Use Claude to route a WhatsApp message: YouTube action or not_youtube."""
     client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
 
     response = client.messages.create(
         model="claude-sonnet-4-20250514",
         max_tokens=512,
-        system=INTENT_SYSTEM_PROMPT,
+        system=ROUTER_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": message}],
     )
 
     text = response.content[0].text.strip()
-    # Extract JSON from response
     try:
-        # Handle potential markdown wrapping
         if "```" in text:
             match = re.search(r'```(?:json)?\s*(.*?)\s*```', text, re.DOTALL)
             if match:
                 text = match.group(1)
-        return json.loads(text)
+        result = json.loads(text)
+        # Normalize: support both "action" and "intent" keys
+        if "intent" in result and "action" not in result:
+            result["action"] = result.pop("intent")
+        return result
     except json.JSONDecodeError:
-        return {"intent": "unknown", "params": {"raw_message": message}, "confidence": 0.0}
+        return {"action": "not_youtube", "params": {"raw_message": message, "is_greeting": False}, "confidence": 0.0}
 
 
 # ---------------------------------------------------------------------------
@@ -1332,130 +1299,9 @@ def _format_count(n: int) -> str:
     return str(n)
 
 
-def format_confirmation_message(videos: list, est_minutes: int, label: str = "") -> str:
-    """Format a confirmation message showing video titles, creator, views, likes + time estimate."""
-    lines = ["*SARAh* — Ecco cosa ho trovato" + (f" per {label}" if label else "") + ":\n"]
-    for i, v in enumerate(videos, 1):
-        lines.append(f"{i}. *{v.title}*")
-        creator_part = f"📺 {v.channel}" if v.channel else ""
-        stats_parts = []
-        if v.view_count:
-            stats_parts.append(f"👁 {_format_count(v.view_count)}")
-        if v.like_count:
-            stats_parts.append(f"👍 {_format_count(v.like_count)}")
-        meta_line = "   " + " | ".join(filter(None, [creator_part] + stats_parts))
-        lines.append(meta_line)
-        lines.append(f"   🔗 {v.url}")
-        lines.append("")
-    lines.append(f"⏱ Tempo stimato: ~{est_minutes} minuti")
-    lines.append(f"\nVuoi che proceda? Rispondi *sì* o *no*.")
-    return "\n".join(lines)
-
-
-def store_pending_request(sender: str, intent: str, params: dict, videos: list):
-    """Store a pending request waiting for user confirmation."""
-    sender = _normalize_sender(sender)
-    _pending_requests[sender] = {
-        "intent": intent,
-        "params": params,
-        "videos": [v for v in videos],
-        "timestamp": datetime.now().isoformat(),
-    }
-
-
-def execute_pending_request(sender: str):
-    """Execute a previously confirmed pending request."""
-    sender = _normalize_sender(sender)
-    pending = _pending_requests.pop(sender, None)
-    if not pending:
-        send_whatsapp_text(sender, "⚠️ Non ho richieste in sospeso da confermare.")
-        return
-
-    intent = pending["intent"]
-    params = pending["params"]
-    videos = pending["videos"]
-
-    mood = get_sarah_mood()
-    est = estimate_minutes(len(videos))
-    send_whatsapp_text(sender, f"{mood['emoji']} Perfetto! Ci lavoro subito.\n\n⏱ Tempo stimato: ~{est} minuti\n\nTi mando il briefing audio appena pronto.")
-
-    creator_name = params.get("creator", params.get("label", "ricerca"))
-    user_focus = params.get("_original_message", "")
-    analyses = process_videos(videos, creator_name, sender, user_focus=user_focus)
-    generate_and_send_briefing(analyses, sender, label=f"vo-{slugify(creator_name)}")
-
-
-def handle_greeting(params: dict, sender: str):
-    """Intent 8: Greet the user. Personalized with memory."""
-    asks_mood = params.get("asks_mood", False)
-    name = params.get("name", "")
-    memory = load_user_memory(sender)
-
-    # Use name from params or from memory
-    if name:
-        memory["name"] = name
-        save_user_memory(sender, memory)
-    else:
-        name = memory.get("name", "")
-    greeting_name = f" {name}" if name else ""
-
-    hour = datetime.now().hour
-    if hour < 12:
-        time_greeting = "Buongiorno"
-    elif hour < 18:
-        time_greeting = "Buon pomeriggio"
-    else:
-        time_greeting = "Buonasera"
-
-    lines = [f"*SARAh, l'unclock intelligence*\n"]
-
-    # Personalized greeting for returning users
-    msg_count = memory.get("message_count", 0)
-    if msg_count > 5 and name:
-        lines.append(f"{time_greeting} {name}! Bentornato/a!")
-    elif msg_count > 0 and name:
-        lines.append(f"{time_greeting} {name}! Sono SARAh.")
-    else:
-        lines.append(f"{time_greeting}{greeting_name}! Sono SARAh.")
-
-    if asks_mood:
-        mood = get_sarah_mood()
-        lines.append(f"\nOggi a Milano: {mood['weather_desc']}, {mood['temp']}°C.")
-        lines.append(f"Il mio umore? Sono {mood['mood']}! {mood['emoji']}\n")
-
-    if msg_count == 0:
-        # First time user — show full capabilities
-        lines.append("\nCome posso aiutarti? Ecco cosa so fare:\n")
-        lines.append("📹 Analisi canale — _\"ultimi 3 video di Chase\"_")
-        lines.append("🔗 Video singolo — _manda un link YouTube_")
-        lines.append("🔍 Cerca topic — _\"chi parla di MCP servers?\"_")
-        lines.append("⚔️ Confronto — _\"confronta Chase e Cole su Claude Code\"_")
-        lines.append("💬 Approfondimento — _\"approfondisci il punto su...\"_")
-        lines.append("📅 Programmazione — _\"aggiornami ogni lunedì su Chase\"_")
-        lines.append("📰 Novità — _\"novità su AI agents questa settimana\"_")
-    else:
-        lines.append("\nCosa vuoi sapere oggi?")
-
-    send_whatsapp_text(sender, "\n".join(lines))
-
-
-def handle_confirmation(params: dict, sender: str):
-    """Intent 9: User confirms or rejects a pending request."""
-    confirmed = params.get("confirmed", False)
-
-    if confirmed:
-        if sender in _pending_requests:
-            execute_pending_request(sender)
-        else:
-            send_whatsapp_text(sender, "⚠️ Non ho richieste in sospeso. Mandami un comando!")
-    else:
-        _pending_requests.pop(sender, None)
-        mood = get_sarah_mood()
-        send_whatsapp_text(sender, f"{mood['emoji']} Ok, annullato! Mandami un'altra richiesta quando vuoi.")
-
 
 def handle_channel_analysis(params: dict, sender: str):
-    """Intent 1: Analyze last N videos from a creator."""
+    """Analyze last N videos from a creator. Executes immediately."""
     creator_name = params.get("creator", "")
     n = params.get("n", 5)
     keywords = params.get("keywords", [])
@@ -1465,7 +1311,6 @@ def handle_channel_analysis(params: dict, sender: str):
         send_whatsapp_text(sender, f"❌ Non conosco il creator \"{creator_name}\". Prova con un URL YouTube o aggiungilo alla lista dei creator conosciuti.")
         return
 
-    # Reconstruct original request from params for validation
     original_request = params.get("_original_message", f"ultimi {n} video di {creator_name}")
     print(f"\n📡 Channel analysis: {creator_name} (last {n}, keywords={keywords})")
 
@@ -1476,7 +1321,6 @@ def handle_channel_analysis(params: dict, sender: str):
         send_whatsapp_text(sender, f"⚠️ Nessun video trovato per {creator_name}.")
         return
 
-    # Validator ↔ Finder loop
     videos = validated_search(
         original_request=original_request,
         videos=videos,
@@ -1489,14 +1333,18 @@ def handle_channel_analysis(params: dict, sender: str):
         send_whatsapp_text(sender, f"⚠️ Nessun video coerente trovato per {creator_name}.")
         return
 
+    # Execute immediately — no confirmation needed
     est = estimate_minutes(len(videos))
-    msg = format_confirmation_message(videos, est, label=creator_name)
-    send_whatsapp_text(sender, msg)
-    store_pending_request(sender, "channel_analysis", {"creator": creator_name, "label": creator_name, "_original_message": original_request}, videos)
+    mood = get_sarah_mood()
+    send_whatsapp_text(sender, f"{mood['emoji']} Ci lavoro subito! Analizzo {len(videos)} video di {creator_name}.\n\n⏱ Tempo stimato: ~{est} minuti\n\nTi mando il briefing audio appena pronto.")
+
+    user_focus = params.get("_original_message", "")
+    analyses = process_videos(videos, creator_name, sender, user_focus=user_focus)
+    generate_and_send_briefing(analyses, sender, label=f"vo-{slugify(creator_name)}")
 
 
 def handle_single_video(params: dict, sender: str):
-    """Intent 2: Analyze a single video URL."""
+    """Analyze a single video URL. Executes immediately."""
     url = params.get("url", "")
     if not url:
         send_whatsapp_text(sender, "❌ Non ho trovato un URL YouTube valido nel messaggio.")
@@ -1509,15 +1357,18 @@ def handle_single_video(params: dict, sender: str):
         send_whatsapp_text(sender, f"⚠️ Non riesco a ottenere info per questo video.")
         return
 
+    # Execute immediately — no confirmation needed
     est = estimate_minutes(1)
-    msg = format_confirmation_message([video], est)
-    send_whatsapp_text(sender, msg)
-    original_request = params.get("_original_message", "")
-    store_pending_request(sender, "single_video", {"label": "video-singolo", "_original_message": original_request}, [video])
+    mood = get_sarah_mood()
+    send_whatsapp_text(sender, f"{mood['emoji']} Ci lavoro subito! Analizzo: *{video.title}*\n\n⏱ Tempo stimato: ~{est} minuti")
+
+    user_focus = params.get("focus", params.get("_original_message", ""))
+    analyses = process_videos([video], "video-singolo", sender, user_focus=user_focus)
+    generate_and_send_briefing(analyses, sender, label="vo-video-singolo")
 
 
 def handle_topic_search(params: dict, sender: str):
-    """Intent 3: Search YouTube for a topic."""
+    """Search YouTube for a topic. Executes immediately."""
     topic = params.get("topic", "")
     country = params.get("country", "")
     period = params.get("period", "week")
@@ -1525,7 +1376,6 @@ def handle_topic_search(params: dict, sender: str):
     language = params.get("language", "")
 
     query = topic
-    # Add language qualifier to search query
     if language:
         query = f"{topic} {language}"
     elif country:
@@ -1543,7 +1393,6 @@ def handle_topic_search(params: dict, sender: str):
         send_whatsapp_text(sender, f"⚠️ Nessun video trovato per \"{topic}\".")
         return
 
-    # Validator ↔ Finder loop
     videos = validated_search(
         original_request=original_request,
         videos=videos,
@@ -1556,10 +1405,13 @@ def handle_topic_search(params: dict, sender: str):
         send_whatsapp_text(sender, f"⚠️ Nessun video coerente trovato per \"{topic}\".")
         return
 
+    # Execute immediately — no confirmation needed
     est = estimate_minutes(len(videos))
-    msg = format_confirmation_message(videos, est, label=f"ricerca \"{topic}\"")
-    send_whatsapp_text(sender, msg)
-    store_pending_request(sender, "topic_search", {"label": f"search-{slugify(topic)}", "_original_message": original_request}, videos)
+    mood = get_sarah_mood()
+    send_whatsapp_text(sender, f"{mood['emoji']} Ci lavoro subito! Analizzo {len(videos)} video su \"{topic}\".\n\n⏱ Tempo stimato: ~{est} minuti\n\nTi mando il briefing audio appena pronto.")
+
+    analyses = process_videos(videos, f"search-{slugify(topic)}", sender, user_focus=original_request)
+    generate_and_send_briefing(analyses, sender, label=f"vo-search-{slugify(topic)}")
 
 
 def handle_multi_creator(params: dict, sender: str):
@@ -1590,11 +1442,15 @@ def handle_multi_creator(params: dict, sender: str):
         send_whatsapp_text(sender, f"⚠️ Nessun video trovato per i creator specificati.")
         return
 
+    # Execute immediately — no confirmation needed
     est = estimate_minutes(len(all_videos))
     label = f"confronto {', '.join(creators)}"
-    msg = format_confirmation_message(all_videos, est, label=label)
-    send_whatsapp_text(sender, msg)
-    store_pending_request(sender, "multi_creator", {"label": f"multi-{slugify(topic)}", "creator": f"multi-{slugify(topic)}"}, all_videos)
+    mood = get_sarah_mood()
+    send_whatsapp_text(sender, f"{mood['emoji']} Ci lavoro subito! Confronto {len(all_videos)} video di {label}.\n\n⏱ Tempo stimato: ~{est} minuti\n\nTi mando il briefing audio appena pronto.")
+
+    user_focus = params.get("_original_message", "")
+    analyses = process_videos(all_videos, f"multi-{slugify(topic)}", sender, user_focus=user_focus)
+    generate_and_send_briefing(analyses, sender, label=f"vo-multi-{slugify(topic)}")
 
 
 def handle_follow_up_intent(params: dict, sender: str):
@@ -1831,56 +1687,96 @@ def handle_news_search(params: dict, sender: str):
         send_whatsapp_text(sender, f"⚠️ Nessun video coerente trovato su \"{topic}\".")
         return
 
+    # Execute immediately — no confirmation needed
     est = estimate_minutes(len(videos))
-    msg = format_confirmation_message(videos, est, label=f"novità su \"{topic}\"")
-    send_whatsapp_text(sender, msg)
-    store_pending_request(sender, "news_search", {"label": f"news-{slugify(topic)}", "creator": f"news-{slugify(topic)}", "_original_message": original_request}, videos)
-
-
-def handle_unknown(params: dict, sender: str):
-    """Fallback: respond conversationally like a real chatbot, with user memory."""
-    raw_message = params.get("raw_message", "")
-    print(f"  💬 General conversation: \"{raw_message}\"")
-
     mood = get_sarah_mood()
+    send_whatsapp_text(sender, f"{mood['emoji']} Ci lavoro subito! Analizzo {len(videos)} novità su \"{topic}\".\n\n⏱ Tempo stimato: ~{est} minuti\n\nTi mando il briefing audio appena pronto.")
+
+    analyses = process_videos(videos, f"news-{slugify(topic)}", sender, user_focus=original_request)
+    generate_and_send_briefing(analyses, sender, label=f"vo-news-{slugify(topic)}")
+
+
+def handle_not_youtube(params: dict, sender: str):
+    """Non-YouTube message: polite decline with examples, or greeting."""
+    raw_message = params.get("raw_message", params.get("_original_message", ""))
+    is_greeting = params.get("is_greeting", False)
+
     memory = load_user_memory(sender)
-    user_context = format_user_context(memory)
     user_name = memory.get("name", "")
-    name_instruction = f"\nL'utente si chiama {user_name}. Chiamalo per nome." if user_name else ""
+    mood = get_sarah_mood()
 
-    client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+    # Check if user is introducing themselves
+    name_match = re.search(r'(?:sono|mi chiamo|chiamami)\s+(\w+)', raw_message, re.IGNORECASE)
+    if name_match:
+        detected_name = name_match.group(1).capitalize()
+        memory["name"] = detected_name
+        save_user_memory(sender, memory)
+        user_name = detected_name
 
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=1024,
-        system=f"""Sei SARAh, l'unclock intelligence — un'assistente AI specializzata nell'analisi di video YouTube.
-Sei simpatica, professionale e parli in italiano. Il tuo umore oggi: {mood['mood']} {mood['emoji']} (meteo Milano: {mood['weather_desc']}).{name_instruction}
+    greeting_name = f" {user_name}" if user_name else ""
 
-MEMORIA UTENTE:
-{user_context}
+    if is_greeting:
+        # Greeting — respond warmly + show capabilities
+        hour = datetime.now().hour
+        if hour < 12:
+            time_greeting = "Buongiorno"
+        elif hour < 18:
+            time_greeting = "Buon pomeriggio"
+        else:
+            time_greeting = "Buonasera"
 
-Usa la memoria SOLO come contesto interno per capire chi è l'utente. NON menzionare MAI le sue preferenze, creator preferiti, topic di interesse o storico conversazioni nella risposta. Non fare recap delle sue attività passate. Rispondi in modo naturale come se sapessi già chi è, senza dirlo esplicitamente.
+        asks_mood = any(q in raw_message.lower() for q in ["come stai", "come va", "come ti senti", "tutto bene"])
+        mood_line = ""
+        if asks_mood:
+            mood_line = f"\nOggi a Milano: {mood['weather_desc']}, {mood['temp']}°C. Sono {mood['mood']}! {mood['emoji']}\n"
 
-Rispondi in modo naturale e conversazionale. Se la domanda non riguarda YouTube, rispondi comunque in modo utile ma ricorda gentilmente che il tuo punto forte è l'analisi video YouTube.
+        msg_count = memory.get("message_count", 0)
+        if msg_count > 5 and user_name:
+            greeting = f"{time_greeting} {user_name}! Bentornato/a!"
+        elif user_name:
+            greeting = f"{time_greeting} {user_name}! Sono SARAh."
+        else:
+            greeting = f"{time_greeting}{greeting_name}! Sono SARAh, l'unclock intelligence."
 
-Se l'utente sembra voler fare qualcosa legato a YouTube ma non ha formulato bene la richiesta, aiutalo a riformularla suggerendo esempi concreti.
+        lines = [f"*SARAh, l'unclock intelligence*\n", greeting]
+        if mood_line:
+            lines.append(mood_line)
+        lines.append("\nMandami qualsiasi cosa su YouTube e ci penso io! Ecco qualche esempio:\n")
+        lines.append("📹 _\"ultimi 3 video di Chase\"_")
+        lines.append("🔗 _manda un link YouTube_")
+        lines.append("🔍 _\"chi parla di MCP servers?\"_")
+        lines.append("📰 _\"novità su AI agents questa settimana\"_")
+        lines.append("⚔️ _\"confronta Chase e Cole su Claude Code\"_")
+        send_whatsapp_text(sender, "\n".join(lines))
+    else:
+        # Not YouTube — polite decline + examples
+        client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+        name_instruction = f"\nL'utente si chiama {user_name}. Chiamalo per nome." if user_name else ""
 
-Le tue capacità YouTube:
-- Analisi ultimi video di un creator
-- Riassunto di un video singolo (da link)
-- Ricerca video per topic/tema (con filtri per paese, lingua, periodo)
-- Confronto tra creator su un tema
-- Approfondimento su analisi precedenti
-- Programmazione briefing ricorrenti
-- Ricerca novità su un tema
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=300,
+            system=f"""Sei SARAh, l'unclock intelligence. Il tuo umore: {mood['mood']} {mood['emoji']}.{name_instruction}
 
-Rispondi in modo conciso (max 3-4 frasi) su WhatsApp. Non usare markdown pesante.""",
-        messages=[{"role": "user", "content": raw_message}],
-    )
+L'utente ti ha scritto qualcosa che NON riguarda video YouTube. Tu ti occupi SOLO di analisi video YouTube.
 
-    reply = response.content[0].text.strip()
-    send_whatsapp_text(sender, reply)
-    print(f"  💬 Replied: {reply[:100]}...")
+Rispondi in modo simpatico e breve (max 2-3 frasi):
+1. Digli in modo carino che non è il tuo campo
+2. Ricordagli cosa sai fare con 3-4 esempi concreti di domande YouTube
+
+Esempi di cosa suggerire:
+- "ultimi video di [creator]"
+- mandare un link YouTube da analizzare
+- "chi parla di [argomento]?"
+- "novità su [tema] questa settimana"
+
+Sii simpatica, non robotica. Non usare markdown pesante.""",
+            messages=[{"role": "user", "content": raw_message}],
+        )
+
+        reply = response.content[0].text.strip()
+        send_whatsapp_text(sender, reply)
+        print(f"  💬 Not-YouTube reply: {reply[:100]}...")
 
 
 def handle_feedback(params: dict, sender: str):
@@ -1937,8 +1833,8 @@ Sii concisa (max 4-5 frasi). Non usare markdown pesante.""",
     print(f"  🐛 Feedback reply: {reply[:100]}...")
 
 
-# Intent routing
-INTENT_HANDLERS = {
+# Action routing
+ACTION_HANDLERS = {
     "channel_analysis": handle_channel_analysis,
     "single_video": handle_single_video,
     "topic_search": handle_topic_search,
@@ -1946,10 +1842,8 @@ INTENT_HANDLERS = {
     "follow_up": handle_follow_up_intent,
     "scheduling": handle_scheduling,
     "news_search": handle_news_search,
-    "greeting": handle_greeting,
-    "confirmation": handle_confirmation,
     "feedback": handle_feedback,
-    "unknown": handle_unknown,
+    "not_youtube": handle_not_youtube,
 }
 
 
@@ -1957,30 +1851,8 @@ INTENT_HANDLERS = {
 # Main entry point: process a WhatsApp message
 # ---------------------------------------------------------------------------
 
-def _is_short_greeting(lower_msg: str) -> bool:
-    """True only for SHORT greeting-only messages (not commands that start with 'ciao')."""
-    # Pure greeting words (message is ONLY this)
-    pure_greetings = ["ciao", "hey", "salve", "buongiorno", "buonasera", "buon pomeriggio",
-                      "sarah", "sara", "ciao sarah", "ciao sara", "hey sarah", "hey sara",
-                      "buongiorno sarah", "buongiorno sara", "buonasera sarah", "buonasera sara",
-                      "ciao come stai", "come stai", "come va", "come stai sarah", "come stai sara",
-                      "come va sarah", "come sta sarah", "come sta sara", "tutto bene",
-                      "ciao sarah come stai", "ciao sara come stai", "ciao come va",
-                      "ciao sarah come va", "buongiorno come stai", "buonasera come stai"]
-    if lower_msg in pure_greetings:
-        return True
-    # Very short message with sarah/sara in it — likely a greeting, not a command
-    sarah_words = ["sarah", "sara"]
-    if any(s in lower_msg for s in sarah_words) and len(lower_msg) < 30:
-        # But NOT if it also contains command-like words
-        command_words = ["video", "ultimi", "analizza", "cerca", "novità", "confronta", "riassumi", "manda", "briefing"]
-        if not any(c in lower_msg for c in command_words):
-            return True
-    return False
-
-
 def process_whatsapp_message(message: str, sender: str = None):
-    """Main entry: parse intent from a message and execute the right handler."""
+    """Main entry: route message and execute immediately. No confirmation needed."""
     sender = _normalize_sender(sender or WHATSAPP_RECIPIENT)
 
     print(f"\n{'='*60}")
@@ -1990,85 +1862,44 @@ def process_whatsapp_message(message: str, sender: str = None):
     print(f"Message: {message}")
     print()
 
-    lower_msg = message.lower().strip()
+    # --- Step 1: Fast-path for direct YouTube URLs → process immediately ---
+    yt_url_match = re.search(r'(https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)[\w-]+)', message)
+    if yt_url_match:
+        url = yt_url_match.group(1)
+        # Extract focus instructions (anything besides the URL)
+        focus = re.sub(r'https?://\S+', '', message).strip()
+        action = "single_video"
+        params = {"url": url, "focus": focus, "_original_message": message}
+        print(f"   Action: {action} (URL fast-path)")
+        print(f"   Params: {params}")
 
-    # --- Step 1: Expire stale pending requests (older than 30 min) ---
-    if sender in _pending_requests:
-        pending_ts = _pending_requests[sender].get("timestamp", "")
-        try:
-            if pending_ts and (datetime.now() - datetime.fromisoformat(pending_ts)).total_seconds() > 1800:
-                print(f"  ⏰ Pending request expired, removing")
-                _pending_requests.pop(sender, None)
-        except Exception:
-            pass
+        handle_single_video(params, sender)
+        log_message(sender, message, action, params, outcome="handled")
+        update_user_memory(sender, message, action, params)
 
-    # --- Step 2: Fast pattern matching (no API call) ---
+        print(f"\n{'='*60}")
+        print(f"✅ Done processing message")
+        print(f"{'='*60}\n")
+        return
 
-    # 2a-pre. Complaint/feedback detection (keyword-based, high priority)
-    _complaint_phrases = [
-        "hai sbagliato", "non funziona", "non ha funzionato", "non va",
-        "hai capito male", "non era quello", "non era questa", "non è giusto",
-        "non hai trovato", "non hai capito", "roba vecchia", "video sbagliati",
-        "non arriva", "non mi arriva", "errore", "c'è un errore", "c'è un problema",
-        "non è quello che volevo", "non è quello che ti ho chiesto",
-        "mi hai mandato", "hai mandato sbagliato", "non quelli",
-    ]
-    if any(phrase in lower_msg for phrase in _complaint_phrases):
-        intent_result = {"intent": "feedback", "params": {"complaint": message, "raw_message": message}, "confidence": 1.0}
+    # --- Step 2: Claude router → YouTube action or not_youtube ---
+    print("🧠 Routing message...")
+    route_result = route_message(message)
 
-    # 2a. Pure greeting (ONLY if message is short and greeting-only)
-    elif _is_short_greeting(lower_msg):
-        asks_mood = any(q in lower_msg for q in ["come stai", "come va", "come ti senti", "tutto bene", "che umore", "come sta sarah", "come sta sara"])
-        # Extract name if user introduces themselves: "sono X", "mi chiamo X"
-        detected_name = ""
-        name_match = re.search(r'(?:sono|mi chiamo|chiamami)\s+(\w+)', lower_msg, re.IGNORECASE)
-        if name_match:
-            detected_name = name_match.group(1).capitalize()
-        intent_result = {"intent": "greeting", "params": {"asks_mood": asks_mood, "name": detected_name}, "confidence": 1.0}
+    action = route_result.get("action", "not_youtube")
+    params = route_result.get("params", {})
+    confidence = route_result.get("confidence", 0)
 
-    # 2b. Confirmation — only if pending request exists
-    elif sender in _pending_requests:
-        confirm_yes = ["sì", "si", "yes", "ok", "vai", "procedi", "confermo", "conferma",
-                       "certo", "perfetto", "fallo", "manda", "si grazie", "ok vai",
-                       "si perfetto", "vai pure", "procedi pure"]
-        confirm_no = ["no", "annulla", "stop", "cancella", "non quelli", "ferma",
-                      "lascia stare", "niente", "no grazie", "non serve"]
-        if any(lower_msg == w or lower_msg.startswith(w + " ") or lower_msg.startswith(w + ",") or lower_msg.startswith(w + "!") for w in confirm_yes):
-            intent_result = {"intent": "confirmation", "params": {"confirmed": True}, "confidence": 1.0}
-        elif any(lower_msg == w or lower_msg.startswith(w + " ") or lower_msg.startswith(w + ",") or lower_msg.startswith(w + "!") for w in confirm_no):
-            intent_result = {"intent": "confirmation", "params": {"confirmed": False}, "confidence": 1.0}
-        else:
-            # New command while pending — discard old pending request
-            print(f"  ⚠ New command while pending request active — discarding old request")
-            _pending_requests.pop(sender, None)
-            print("🧠 Parsing intent...")
-            intent_result = parse_intent(message)
-
-    # 2c. Direct YouTube URL
-    elif re.search(r'(https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)[\w-]+)', message) and len(message.strip()) < 200:
-        yt_url_match = re.search(r'(https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)[\w-]+)', message)
-        intent_result = {"intent": "single_video", "params": {"url": yt_url_match.group(1)}, "confidence": 1.0}
-
-    # 2d. Everything else → Claude intent parsing
-    else:
-        print("🧠 Parsing intent...")
-        intent_result = parse_intent(message)
-
-    intent = intent_result.get("intent", "unknown")
-    params = intent_result.get("params", {})
-    confidence = intent_result.get("confidence", 0)
-
-    print(f"   Intent: {intent} (confidence: {confidence})")
+    print(f"   Action: {action} (confidence: {confidence})")
     print(f"   Params: {params}")
 
-    # Pass original message to handlers for Validator Agent context
     params["_original_message"] = message
 
-    handler = INTENT_HANDLERS.get(intent, handle_unknown)
+    handler = ACTION_HANDLERS.get(action, handle_not_youtube)
     handler(params, sender)
 
-    log_message(sender, message, intent, params, outcome="handled")
-    update_user_memory(sender, message, intent, params)
+    log_message(sender, message, action, params, outcome="handled")
+    update_user_memory(sender, message, action, params)
 
     print(f"\n{'='*60}")
     print(f"✅ Done processing message")
@@ -2207,7 +2038,7 @@ def start_server(port: int = None):
 
     server = HTTPServer(("0.0.0.0", port), WebhookHandler)
     print(f"\n🚀 SARAh, l'unclock intelligence — server running on port {port}")
-    print(f"   Version: 2026-04-01-v5 (elevenlabs-voice)")
+    print(f"   Version: 2026-04-06-v6 (youtube-first-router)")
     print(f"   Webhook URL: http://localhost:{port}/webhook")
     print(f"   Health check: http://localhost:{port}/health")
     print(f"\n   Waiting for WhatsApp messages...\n")
