@@ -1321,7 +1321,7 @@ def generate_audio_elevenlabs(text: str, output_path: str) -> bool:
         return False
 
 
-def generate_audio_edge_tts(text: str, output_path: str, voice: str = "it-IT-DiegoNeural") -> bool:
+def generate_audio_edge_tts(text: str, output_path: str, voice: str = "it-IT-ElsaNeural") -> bool:
     """Generate OGG Opus audio from text using Edge TTS (fallback)."""
     async def _generate():
         communicate = edge_tts.Communicate(text, voice)
