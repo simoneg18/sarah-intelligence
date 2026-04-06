@@ -640,7 +640,7 @@ def route_message(message: str, sender: str = None) -> dict:
     system_prompt = ROUTER_SYSTEM_PROMPT + learning_context
 
     response = client.messages.create(
-        model="claude-3-5-haiku-20241022",
+        model="claude-sonnet-4-20250514",
         max_tokens=512,
         system=system_prompt,
         messages=[{"role": "user", "content": message}],
@@ -2090,7 +2090,7 @@ def _self_check_routing(user_message: str, sender: str) -> dict | None:
     user_context = "\n".join(context_parts) if context_parts else "Nessun contesto disponibile."
 
     response = client.messages.create(
-        model="claude-3-5-haiku-20241022",
+        model="claude-sonnet-4-20250514",
         max_tokens=400,
         system=f"""Sei un verificatore per SARAh, un sistema che trascrive e analizza video YouTube.
 
