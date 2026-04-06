@@ -42,7 +42,7 @@ ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "nPczCjzI2devNBz1zQrb")  # Brian - Deep, Resonant and Comforting
 
 # Known creators mapping — extend as needed
-KNOWN_CREATORS = {
+_DEFAULT_CREATORS = {
     "chase": "https://www.youtube.com/@Chase-H-AI",
     "chase ai": "https://www.youtube.com/@Chase-H-AI",
     "chase h ai": "https://www.youtube.com/@Chase-H-AI",
@@ -64,14 +64,105 @@ KNOWN_CREATORS = {
     "yc": "https://www.youtube.com/@ycombinator",
 }
 
+# Persistent learned creators file
+LEARNED_CREATORS_FILE = os.path.join(OUTPUT_DIR, "learned_creators.json")
+
+# Successful query mappings file
+LEARNED_QUERIES_FILE = os.path.join(OUTPUT_DIR, "learned_queries.json")
+
+# Learned error patterns file
+LEARNED_ERRORS_FILE = os.path.join(OUTPUT_DIR, "learned_errors.json")
+
+
+def _load_learned_creators() -> dict:
+    """Load previously learned creator mappings from disk."""
+    try:
+        with open(LEARNED_CREATORS_FILE, "r", encoding="utf-8") as f:
+            return json.loads(f.read())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_learned_creator(name: str, url: str):
+    """Persist a newly learned creator mapping."""
+    learned = _load_learned_creators()
+    learned[name.lower().strip()] = url
+    os.makedirs(os.path.dirname(LEARNED_CREATORS_FILE), exist_ok=True)
+    with open(LEARNED_CREATORS_FILE, "w", encoding="utf-8") as f:
+        f.write(json.dumps(learned, ensure_ascii=False, indent=2))
+    print(f"  💾 Learned creator saved: {name} → {url}")
+
+
+# Build KNOWN_CREATORS = defaults + learned (learned can override)
+KNOWN_CREATORS = {**_DEFAULT_CREATORS, **_load_learned_creators()}
+
 # Conversation memory for follow-up intent (in-memory, resets on restart)
 _conversation_history = {}
 
-# Pending confirmation requests: sender -> {intent, params, videos, timestamp}
-_pending_requests = {}
-
 # Message log file
 MESSAGE_LOG = os.path.join(OUTPUT_DIR, "message_log.jsonl")
+
+
+# ---------------------------------------------------------------------------
+# Query success learning
+# ---------------------------------------------------------------------------
+
+def _load_learned_queries() -> list:
+    """Load successful query mappings."""
+    try:
+        with open(LEARNED_QUERIES_FILE, "r", encoding="utf-8") as f:
+            return json.loads(f.read())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def _save_learned_query(user_message: str, action: str, params: dict, video_count: int):
+    """Save a successful query mapping for future reference."""
+    queries = _load_learned_queries()
+    queries.append({
+        "ts": datetime.now().isoformat(),
+        "user_message": user_message[:300],
+        "action": action,
+        "params": {k: v for k, v in params.items() if not k.startswith("_")},
+        "video_count": video_count,
+    })
+    # Keep last 200 successful queries
+    queries = queries[-200:]
+    os.makedirs(os.path.dirname(LEARNED_QUERIES_FILE), exist_ok=True)
+    with open(LEARNED_QUERIES_FILE, "w", encoding="utf-8") as f:
+        f.write(json.dumps(queries, ensure_ascii=False, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# Error pattern learning
+# ---------------------------------------------------------------------------
+
+def _load_learned_errors() -> list:
+    """Load error patterns."""
+    try:
+        with open(LEARNED_ERRORS_FILE, "r", encoding="utf-8") as f:
+            return json.loads(f.read())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def _save_learned_error(user_message: str, action: str, params: dict, error_type: str, error_detail: str):
+    """Save an error pattern to avoid repeating the same mistake."""
+    errors = _load_learned_errors()
+    errors.append({
+        "ts": datetime.now().isoformat(),
+        "user_message": user_message[:300],
+        "action": action,
+        "params": {k: v for k, v in params.items() if not k.startswith("_")},
+        "error_type": error_type,
+        "error_detail": error_detail[:200],
+    })
+    # Keep last 100 errors
+    errors = errors[-100:]
+    os.makedirs(os.path.dirname(LEARNED_ERRORS_FILE), exist_ok=True)
+    with open(LEARNED_ERRORS_FILE, "w", encoding="utf-8") as f:
+        f.write(json.dumps(errors, ensure_ascii=False, indent=2))
+    print(f"  💾 Error pattern saved: {error_type} — {error_detail[:80]}")
 
 # ---------------------------------------------------------------------------
 # Per-user persistent memory (multi-tenant)
@@ -119,10 +210,6 @@ def update_user_memory(sender: str, message: str, intent: str, params: dict):
     memory = load_user_memory(sender)
     memory["message_count"] = memory.get("message_count", 0) + 1
     memory["last_seen"] = datetime.now().isoformat()
-
-    # Detect user name from greeting
-    if intent == "greeting" and params.get("name"):
-        memory["name"] = params["name"]
 
     # Track favorite creators
     creator = params.get("creator", "")
@@ -362,14 +449,80 @@ Rispondi ESCLUSIVAMENTE con JSON valido:
 {"action": "nome_azione", "params": {...}, "confidence": 0.0-1.0}"""
 
 
-def route_message(message: str) -> dict:
-    """Use Claude to route a WhatsApp message: YouTube action or not_youtube."""
+def _build_learning_context(sender: str) -> str:
+    """Build context from user memory, learned queries, and error patterns for smarter routing."""
+    parts = []
+
+    # User memory context
+    memory = load_user_memory(sender)
+    name = memory.get("name", "")
+    if name:
+        parts.append(f"Nome utente: {name}")
+
+    fav_creators = memory.get("favorite_creators", [])
+    if fav_creators:
+        parts.append(f"Creator preferiti di questo utente: {', '.join(fav_creators[:5])}")
+
+    topics = memory.get("topics_of_interest", [])
+    if topics:
+        parts.append(f"Topic di interesse: {', '.join(topics[:5])}")
+
+    # Recent interactions — help disambiguate short messages
+    recent = memory.get("recent_interactions", [])
+    if recent:
+        last_3 = recent[-3:]
+        history = []
+        for r in last_3:
+            msg = r.get("message", "")[:80]
+            action = r.get("intent", "?")
+            history.append(f"  ({action}) {msg}")
+        parts.append("Ultime interazioni:\n" + "\n".join(history))
+
+    # Known creators list — so router knows what names are valid
+    known = list(KNOWN_CREATORS.keys())
+    if known:
+        unique_urls = {}
+        for k, v in KNOWN_CREATORS.items():
+            if v not in unique_urls:
+                unique_urls[v] = k
+        parts.append(f"Creator conosciuti: {', '.join(unique_urls.values())}")
+
+    # Recent successful queries — similar patterns
+    learned_queries = _load_learned_queries()
+    if learned_queries:
+        recent_q = learned_queries[-5:]
+        examples = []
+        for q in recent_q:
+            examples.append(f"  \"{q['user_message'][:60]}\" → {q['action']}")
+        parts.append("Query recenti riuscite:\n" + "\n".join(examples))
+
+    # Recent errors — avoid repeating mistakes
+    learned_errors = _load_learned_errors()
+    if learned_errors:
+        recent_e = learned_errors[-3:]
+        error_notes = []
+        for e in recent_e:
+            error_notes.append(f"  {e['error_type']}: {e['error_detail'][:60]}")
+        parts.append("Errori recenti da evitare:\n" + "\n".join(error_notes))
+
+    if not parts:
+        return ""
+    return "\n\nCONTESTO APPRESO (usa per decisioni migliori, NON menzionare all'utente):\n" + "\n".join(parts)
+
+
+def route_message(message: str, sender: str = None) -> dict:
+    """Use Claude to route a WhatsApp message: YouTube action or not_youtube.
+    Injects user context and learned patterns for smarter routing."""
     client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+
+    # Build dynamic context from learning
+    learning_context = _build_learning_context(sender) if sender else ""
+    system_prompt = ROUTER_SYSTEM_PROMPT + learning_context
 
     response = client.messages.create(
         model="claude-sonnet-4-20250514",
         max_tokens=512,
-        system=ROUTER_SYSTEM_PROMPT,
+        system=system_prompt,
         messages=[{"role": "user", "content": message}],
     )
 
@@ -771,8 +924,9 @@ def resolve_creator(name: str) -> Optional[str]:
         cmd = [*YTDLP, "--flat-playlist", "--dump-json", "--no-download", "--playlist-end", "1", f"{test_url}/videos"]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
         if result.returncode == 0 and result.stdout.strip():
-            # Found! Add to known creators for future use
+            # Found! Add to known creators + persist to disk
             KNOWN_CREATORS[key] = test_url
+            _save_learned_creator(key, test_url)
             print(f"  ✓ Auto-discovered creator: {key} → {test_url}")
             return test_url
     except Exception:
@@ -1309,6 +1463,7 @@ def handle_channel_analysis(params: dict, sender: str):
     channel_url = resolve_creator(creator_name)
     if not channel_url:
         send_whatsapp_text(sender, f"❌ Non conosco il creator \"{creator_name}\". Prova con un URL YouTube o aggiungilo alla lista dei creator conosciuti.")
+        _save_learned_error(params.get("_original_message", ""), "channel_analysis", params, "creator_not_found", f"Creator '{creator_name}' non trovato")
         return
 
     original_request = params.get("_original_message", f"ultimi {n} video di {creator_name}")
@@ -1341,6 +1496,8 @@ def handle_channel_analysis(params: dict, sender: str):
     user_focus = params.get("_original_message", "")
     analyses = process_videos(videos, creator_name, sender, user_focus=user_focus)
     generate_and_send_briefing(analyses, sender, label=f"vo-{slugify(creator_name)}")
+    if analyses:
+        _save_learned_query(params.get("_original_message", ""), "channel_analysis", params, len(analyses))
 
 
 def handle_single_video(params: dict, sender: str):
@@ -1355,6 +1512,7 @@ def handle_single_video(params: dict, sender: str):
     video = get_video_info(url)
     if not video:
         send_whatsapp_text(sender, f"⚠️ Non riesco a ottenere info per questo video.")
+        _save_learned_error(params.get("_original_message", ""), "single_video", params, "video_info_failed", f"get_video_info failed for {url}")
         return
 
     # Execute immediately — no confirmation needed
@@ -1365,6 +1523,8 @@ def handle_single_video(params: dict, sender: str):
     user_focus = params.get("focus", params.get("_original_message", ""))
     analyses = process_videos([video], "video-singolo", sender, user_focus=user_focus)
     generate_and_send_briefing(analyses, sender, label="vo-video-singolo")
+    if analyses:
+        _save_learned_query(params.get("_original_message", ""), "single_video", params, len(analyses))
 
 
 def handle_topic_search(params: dict, sender: str):
@@ -1412,10 +1572,12 @@ def handle_topic_search(params: dict, sender: str):
 
     analyses = process_videos(videos, f"search-{slugify(topic)}", sender, user_focus=original_request)
     generate_and_send_briefing(analyses, sender, label=f"vo-search-{slugify(topic)}")
+    if analyses:
+        _save_learned_query(params.get("_original_message", ""), "topic_search", params, len(analyses))
 
 
 def handle_multi_creator(params: dict, sender: str):
-    """Intent 4: Compare multiple creators on a topic."""
+    """Compare multiple creators on a topic."""
     creators = params.get("creators", [])
     topic = params.get("topic", "")
     n = params.get("n", 3)
@@ -1451,6 +1613,8 @@ def handle_multi_creator(params: dict, sender: str):
     user_focus = params.get("_original_message", "")
     analyses = process_videos(all_videos, f"multi-{slugify(topic)}", sender, user_focus=user_focus)
     generate_and_send_briefing(analyses, sender, label=f"vo-multi-{slugify(topic)}")
+    if analyses:
+        _save_learned_query(params.get("_original_message", ""), "multi_creator", params, len(analyses))
 
 
 def handle_follow_up_intent(params: dict, sender: str):
@@ -1694,6 +1858,8 @@ def handle_news_search(params: dict, sender: str):
 
     analyses = process_videos(videos, f"news-{slugify(topic)}", sender, user_focus=original_request)
     generate_and_send_briefing(analyses, sender, label=f"vo-news-{slugify(topic)}")
+    if analyses:
+        _save_learned_query(params.get("_original_message", ""), "news_search", params, len(analyses))
 
 
 def handle_not_youtube(params: dict, sender: str):
@@ -1832,6 +1998,15 @@ Sii concisa (max 4-5 frasi). Non usare markdown pesante.""",
     send_whatsapp_text(sender, reply)
     print(f"  🐛 Feedback reply: {reply[:100]}...")
 
+    # Save error pattern from feedback for future learning
+    last_action = ""
+    last_params = {}
+    if recent_logs:
+        last_log = recent_logs[-1]
+        last_action = last_log.get("intent", "unknown")
+        last_params = last_log.get("params", {})
+    _save_learned_error(complaint, last_action, last_params, "user_complaint", complaint[:200])
+
 
 # Action routing
 ACTION_HANDLERS = {
@@ -1884,7 +2059,7 @@ def process_whatsapp_message(message: str, sender: str = None):
 
     # --- Step 2: Claude router → YouTube action or not_youtube ---
     print("🧠 Routing message...")
-    route_result = route_message(message)
+    route_result = route_message(message, sender)
 
     action = route_result.get("action", "not_youtube")
     params = route_result.get("params", {})
