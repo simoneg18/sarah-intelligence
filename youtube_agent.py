@@ -1880,7 +1880,8 @@ def _reschedule_recurring(task: dict):
     frequency = task.get("frequency", "weekly")
     schedule_time = task.get("schedule_time", "08:00")
 
-    now = datetime.now()
+    rome_tz = ZoneInfo("Europe/Rome")
+    now = datetime.now(rome_tz)
     h, m = map(int, schedule_time.split(":"))
 
     if frequency == "daily":
@@ -1914,8 +1915,9 @@ def handle_scheduling(params: dict, sender: str):
     # Determine task type
     task_type = "topic" if topic and not creator_name else "channel"
 
-    # Calculate when to fire
-    now = datetime.now()
+    # Calculate when to fire — all times are in Europe/Rome timezone
+    rome_tz = ZoneInfo("Europe/Rome")
+    now = datetime.now(rome_tz)
     h, m = 8, 0
     try:
         h, m = map(int, schedule_time.split(":"))
@@ -1931,11 +1933,11 @@ def handle_scheduling(params: dict, sender: str):
             target = now.replace(hour=h, minute=m, second=0, microsecond=0)
         else:
             try:
-                parsed = datetime.strptime(schedule_date, "%Y-%m-%d").replace(hour=h, minute=m, second=0)
+                parsed = datetime.strptime(schedule_date, "%Y-%m-%d")
                 # Fix wrong year from Claude — if date is far in the past, use current year
                 if parsed.year < now.year:
                     parsed = parsed.replace(year=now.year)
-                target = parsed
+                target = parsed.replace(hour=h, minute=m, second=0, microsecond=0, tzinfo=rome_tz)
             except ValueError:
                 target = (now + timedelta(days=1)).replace(hour=h, minute=m, second=0, microsecond=0)
     elif frequency == "once":
@@ -2685,7 +2687,8 @@ def reload_scheduled_tasks():
     except (json.JSONDecodeError, Exception):
         return
 
-    now = datetime.now()
+    rome_tz = ZoneInfo("Europe/Rome")
+    now = datetime.now(rome_tz)
     reloaded = 0
     for task in schedules:
         if not task.get("active", True):
@@ -2695,6 +2698,9 @@ def reload_scheduled_tasks():
 
         try:
             fire_at = datetime.fromisoformat(fire_at_str)
+            # Ensure timezone-aware (Rome)
+            if fire_at.tzinfo is None:
+                fire_at = fire_at.replace(tzinfo=rome_tz)
         except (ValueError, TypeError):
             continue
 
