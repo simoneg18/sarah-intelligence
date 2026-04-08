@@ -1839,7 +1839,7 @@ def _execute_scheduled_task(task: dict):
             if not channel_url:
                 send_whatsapp_text(sender, f"⚠️ Task programmato: non trovo il canale di {creator_name}")
                 return
-            videos = get_channel_videos(channel_url, max_results=n)
+            videos = get_channel_videos(channel_url, max_videos=n)
             if keywords:
                 videos = [v for v in videos if any(k.lower() in (v.title + v.description).lower() for k in keywords)]
             if not videos:
