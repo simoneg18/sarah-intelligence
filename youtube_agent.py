@@ -170,6 +170,7 @@ def _save_learned_error(user_message: str, action: str, params: dict, error_type
 # ---------------------------------------------------------------------------
 
 LEARNED_BEHAVIORS_FILE = os.path.join(OUTPUT_DIR, "learned_behaviors.json")
+RESPONSE_LOG_FILE = os.path.join(OUTPUT_DIR, "response_log.json")
 
 
 def _load_learned_behaviors() -> list:
@@ -201,6 +202,56 @@ def _save_learned_behavior(rule: str, source_message: str, correct_action: str, 
     with open(LEARNED_BEHAVIORS_FILE, "w", encoding="utf-8") as f:
         f.write(json.dumps(behaviors, ensure_ascii=False, indent=2))
     print(f"  🧠 New behavior learned: {rule[:100]}")
+
+
+def _load_response_log() -> list:
+    """Load the full response log."""
+    try:
+        with open(RESPONSE_LOG_FILE, "r", encoding="utf-8") as f:
+            return json.loads(f.read())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def _save_response_log_entry(sender: str, user_message: str, action: str, params: dict, responses: list, success: bool = True):
+    """Log a complete interaction: user message + SARAh's response(s)."""
+    log = _load_response_log()
+    log.append({
+        "ts": datetime.now().isoformat(),
+        "sender": sender,
+        "user_message": user_message[:500],
+        "action": action,
+        "params": {k: v for k, v in params.items() if not k.startswith("_")},
+        "responses": responses,  # list of {"type": "text"/"audio", "content": "..."}
+        "success": success,
+    })
+    # Keep last 500 interactions
+    log = log[-500:]
+    os.makedirs(os.path.dirname(RESPONSE_LOG_FILE), exist_ok=True)
+    with open(RESPONSE_LOG_FILE, "w", encoding="utf-8") as f:
+        f.write(json.dumps(log, ensure_ascii=False, indent=2))
+
+
+# Thread-local storage to capture responses per interaction
+_current_responses = {}
+
+
+def _start_response_capture(sender: str):
+    """Start capturing responses for this sender."""
+    _current_responses[sender] = []
+
+
+def _capture_response(sender: str, resp_type: str, content: str):
+    """Capture a response (text or audio) for the current interaction."""
+    if sender in _current_responses:
+        _current_responses[sender].append({"type": resp_type, "content": content[:2000]})
+
+
+def _flush_response_log(sender: str, user_message: str, action: str, params: dict, success: bool = True):
+    """Save captured responses and clear the buffer."""
+    responses = _current_responses.pop(sender, [])
+    if responses or not success:
+        _save_response_log_entry(sender, user_message, action, params, responses, success)
 
 
 def _analyze_and_learn(user_message: str, wrong_action: str, context: str = ""):
@@ -1396,12 +1447,14 @@ def send_whatsapp_message(recipient: str, message_body: dict) -> bool:
 
 def send_whatsapp_text(recipient: str, text: str) -> bool:
     print(f"  📤 Sending WA text to {recipient} ({len(text)} chars)")
+    _capture_response(recipient, "text", text)
     result = send_whatsapp_message(recipient, {"type": "text", "text": {"body": text}})
     print(f"  📤 Send result: {result}")
     return result
 
 
 def send_whatsapp_audio(recipient: str, audio_path: str) -> bool:
+    _capture_response(recipient, "audio", f"[audio file: {audio_path}]")
     media_id = upload_media_to_whatsapp(audio_path)
     if not media_id:
         return False
@@ -2377,6 +2430,7 @@ ACTION_HANDLERS = {
 def process_whatsapp_message(message: str, sender: str = None):
     """Main entry: route message and execute immediately. No confirmation needed."""
     sender = _normalize_sender(sender or WHATSAPP_RECIPIENT)
+    _start_response_capture(sender)
 
     print(f"\n{'='*60}")
     print(f"SARAh, l'unclock intelligence — Incoming message")
@@ -2399,6 +2453,7 @@ def process_whatsapp_message(message: str, sender: str = None):
         handle_single_video(params, sender)
         log_message(sender, message, action, params, outcome="handled")
         update_user_memory(sender, message, action, params)
+        _flush_response_log(sender, message, action, params)
 
         print(f"\n{'='*60}")
         print(f"✅ Done processing message")
@@ -2423,6 +2478,7 @@ def process_whatsapp_message(message: str, sender: str = None):
 
     log_message(sender, message, action, params, outcome="handled")
     update_user_memory(sender, message, action, params)
+    _flush_response_log(sender, message, action, params)
 
     print(f"\n{'='*60}")
     print(f"✅ Done processing message")
@@ -2543,6 +2599,17 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 "learned": learned,
                 "total": len(KNOWN_CREATORS),
             }, ensure_ascii=False, indent=2).encode())
+            return
+
+        if path == "/responses":
+            # Return full response log — every interaction with SARAh's actual responses
+            qs = parse_qs(parsed.query)
+            n = int(qs.get("n", ["50"])[0])
+            responses = _load_response_log()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(responses[-n:], ensure_ascii=False, indent=2).encode())
             return
 
         if path == "/stats":
