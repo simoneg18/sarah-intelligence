@@ -637,7 +637,10 @@ def route_message(message: str, sender: str = None) -> dict:
 
     # Build dynamic context from learning
     learning_context = _build_learning_context(sender) if sender else ""
-    system_prompt = ROUTER_SYSTEM_PROMPT + learning_context
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_weekday = ["lunedì","martedì","mercoledì","giovedì","venerdì","sabato","domenica"][datetime.now().weekday()]
+    date_context = f"\n\nDATA DI OGGI: {today_str} ({today_weekday}). Usa questa data per interpretare 'oggi', 'domani', ecc. Quando l'utente dice 'oggi' usa schedule_date='{today_str}'. Quando dice 'domani' usa la data di domani. NON inventare date — calcola a partire da oggi."
+    system_prompt = ROUTER_SYSTEM_PROMPT + date_context + learning_context
 
     response = client.messages.create(
         model="claude-sonnet-4-20250514",
@@ -1874,7 +1877,11 @@ def handle_scheduling(params: dict, sender: str):
             target = now.replace(hour=h, minute=m, second=0, microsecond=0)
         else:
             try:
-                target = datetime.strptime(schedule_date, "%Y-%m-%d").replace(hour=h, minute=m, second=0)
+                parsed = datetime.strptime(schedule_date, "%Y-%m-%d").replace(hour=h, minute=m, second=0)
+                # Fix wrong year from Claude — if date is far in the past, use current year
+                if parsed.year < now.year:
+                    parsed = parsed.replace(year=now.year)
+                target = parsed
             except ValueError:
                 target = (now + timedelta(days=1)).replace(hour=h, minute=m, second=0, microsecond=0)
     elif frequency == "once":
