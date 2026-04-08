@@ -16,7 +16,8 @@ import sys
 import threading
 import traceback
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Optional
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -2612,6 +2613,18 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps(responses[-n:], ensure_ascii=False, indent=2).encode())
             return
 
+        if path == "/daily-report":
+            # Trigger daily report manually (GET /daily-report?send=true to also send via WhatsApp)
+            qs = parse_qs(parsed.query)
+            report = _generate_daily_report()
+            if qs.get("send", ["false"])[0] == "true":
+                threading.Thread(target=send_whatsapp_text, args=(DAILY_REPORT_RECIPIENT, report), daemon=True).start()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(report.encode())
+            return
+
         if path == "/stats":
             # Return full learning stats summary
             errors = _load_learned_errors()
@@ -2702,6 +2715,181 @@ def reload_scheduled_tasks():
         print(f"  📅 Reloaded {reloaded} scheduled task(s)")
 
 
+# ---------------------------------------------------------------------------
+# Daily Report — sent to admin every day at 22:00 Rome time
+# ---------------------------------------------------------------------------
+
+ROME_TZ = ZoneInfo("Europe/Rome")
+DAILY_REPORT_HOUR = 22  # 22:00 Rome time
+DAILY_REPORT_RECIPIENT = WHATSAPP_RECIPIENT  # Simone
+
+
+def _generate_daily_report() -> str:
+    """Generate the daily report text from today's responses, errors, and stats."""
+    now_rome = datetime.now(ROME_TZ)
+    today_str = now_rome.strftime("%Y-%m-%d")
+    today_label = now_rome.strftime("%d/%m/%Y")
+    weekdays = ["lunedì", "martedì", "mercoledì", "giovedì", "venerdì", "sabato", "domenica"]
+    day_name = weekdays[now_rome.weekday()]
+
+    # Load data
+    responses = _load_response_log()
+    errors = _load_learned_errors()
+
+    # Filter today only
+    today_responses = [r for r in responses if r.get("ts", "").startswith(today_str)]
+    today_errors = [e for e in errors if e.get("ts", "").startswith(today_str)]
+
+    # --- Section 1: Riepilogo ---
+    total = len(today_responses)
+    senders = {}
+    for r in today_responses:
+        s = r.get("sender", "unknown")
+        senders[s] = senders.get(s, 0) + 1
+    success_count = sum(1 for r in today_responses if r.get("success", True))
+    success_rate = (success_count / total * 100) if total > 0 else 0
+
+    # Anonymize senders
+    sender_map = {}
+    for i, s in enumerate(sorted(senders.keys()), 1):
+        sender_map[s] = f"Utente {i}"
+
+    lines = [
+        f"📊 *REPORT GIORNALIERO SARAh*",
+        f"📅 {today_label} ({day_name})",
+        "",
+        "━━━━━━━━━━━━━━━━━━━━━━━━",
+        "*1. RIEPILOGO*",
+        f"• Messaggi totali: {total}",
+        f"• Utenti attivi: {len(senders)}",
+    ]
+    for s, count in senders.items():
+        lines.append(f"  - {sender_map[s]}: {count} messaggi")
+    lines.append(f"• Tasso di successo: {success_rate:.0f}%")
+
+    # --- Section 2: Dettaglio interazioni ---
+    lines.extend(["", "━━━━━━━━━━━━━━━━━━━━━━━━", "*2. DETTAGLIO INTERAZIONI*", ""])
+    if not today_responses:
+        lines.append("Nessuna interazione oggi.")
+    else:
+        for r in today_responses:
+            ts = r.get("ts", "")
+            try:
+                hora = datetime.fromisoformat(ts).strftime("%H:%M")
+            except (ValueError, TypeError):
+                hora = "??:??"
+            sender_label = sender_map.get(r.get("sender", ""), "?")
+            user_msg = r.get("user_message", "")[:100]
+            action = r.get("action", "?")
+            resp_list = r.get("responses", [])
+            resp_summary = ""
+            if resp_list:
+                first_resp = resp_list[0].get("content", "")[:120]
+                resp_summary = first_resp
+                if len(resp_list) > 1:
+                    resp_summary += f" (+{len(resp_list)-1} altri)"
+            success = "✅" if r.get("success", True) else "❌"
+
+            lines.append(f"🕐 {hora} | {sender_label}")
+            lines.append(f"💬 _{user_msg}_")
+            lines.append(f"🎯 {action} {success}")
+            if resp_summary:
+                lines.append(f"📤 {resp_summary}")
+            lines.append("")
+
+    # --- Section 3: Errori ---
+    lines.extend(["━━━━━━━━━━━━━━━━━━━━━━━━", "*3. ERRORI*", ""])
+    if not today_errors:
+        lines.append("Nessun errore oggi 🎉")
+    else:
+        for e in today_errors:
+            ts = e.get("ts", "")
+            try:
+                hora = datetime.fromisoformat(ts).strftime("%H:%M")
+            except (ValueError, TypeError):
+                hora = "??:??"
+            lines.append(f"❌ {hora} — {e.get('error', 'unknown')[:150]}")
+        lines.append(f"\nTotale errori: {len(today_errors)}")
+
+    # --- Section 4: Pattern e trend ---
+    lines.extend(["", "━━━━━━━━━━━━━━━━━━━━━━━━", "*4. PATTERN E TREND*", ""])
+    if today_responses:
+        action_counts = {}
+        creators_mentioned = {}
+        topics_mentioned = {}
+        for r in today_responses:
+            a = r.get("action", "?")
+            action_counts[a] = action_counts.get(a, 0) + 1
+            params = r.get("params", {})
+            c = params.get("creator", "")
+            if c:
+                creators_mentioned[c] = creators_mentioned.get(c, 0) + 1
+            t = params.get("topic", "")
+            if t:
+                topics_mentioned[t] = topics_mentioned.get(t, 0) + 1
+
+        lines.append("*Azioni più richieste:*")
+        for a, count in sorted(action_counts.items(), key=lambda x: -x[1]):
+            lines.append(f"  • {a}: {count}x")
+
+        if creators_mentioned:
+            lines.append("\n*Creator più cercati:*")
+            for c, count in sorted(creators_mentioned.items(), key=lambda x: -x[1])[:5]:
+                lines.append(f"  • {c}: {count}x")
+
+        if topics_mentioned:
+            lines.append("\n*Topic più cercati:*")
+            for t, count in sorted(topics_mentioned.items(), key=lambda x: -x[1])[:5]:
+                lines.append(f"  • {t}: {count}x")
+    else:
+        lines.append("Nessun dato per analizzare pattern.")
+
+    # --- Section 5: Suggerimenti (auto-generati da Claude) ---
+    # Skip Claude call to keep it fast and cost-free. Static suggestions based on data.
+    lines.extend(["", "━━━━━━━━━━━━━━━━━━━━━━━━", "*5. NOTE*", ""])
+    if total == 0:
+        lines.append("📝 Nessuna interazione oggi. SARAh è in attesa!")
+    else:
+        if today_errors:
+            lines.append(f"⚠️ {len(today_errors)} errori da investigare.")
+        failed = [r for r in today_responses if not r.get("success", True)]
+        if failed:
+            lines.append(f"⚠️ {len(failed)} risposte con problemi da verificare.")
+        lines.append(f"📝 {total} interazioni totali da {len(senders)} utenti.")
+
+    lines.extend(["", "━━━━━━━━━━━━━━━━━━━━━━━━", "🤖 _Report automatico di SARAh_"])
+
+    return "\n".join(lines)
+
+
+def _send_daily_report():
+    """Send the daily report and reschedule for tomorrow."""
+    try:
+        print(f"\n📊 Generating daily report...")
+        report = _generate_daily_report()
+        send_whatsapp_text(DAILY_REPORT_RECIPIENT, report)
+        print(f"📊 Daily report sent to {DAILY_REPORT_RECIPIENT}")
+    except Exception as e:
+        print(f"❌ Daily report failed: {e}")
+        traceback.print_exc()
+    finally:
+        # Reschedule for tomorrow at 22:00 Rome
+        _schedule_daily_report()
+
+
+def _schedule_daily_report():
+    """Schedule the next daily report at 22:00 Rome time."""
+    now_rome = datetime.now(ROME_TZ)
+    target = now_rome.replace(hour=DAILY_REPORT_HOUR, minute=0, second=0, microsecond=0)
+    if target <= now_rome:
+        target += timedelta(days=1)
+    delay = (target - now_rome).total_seconds()
+    timer = threading.Timer(delay, _send_daily_report)
+    timer.daemon = True
+    timer.start()
+    print(f"  📊 Daily report scheduled for {target.strftime('%Y-%m-%d %H:%M')} Rome ({delay:.0f}s)")
+
+
 def start_server(port: int = None):
     """Start HTTP server for n8n webhook."""
     if port is None:
@@ -2709,6 +2897,9 @@ def start_server(port: int = None):
 
     # Reload scheduled tasks from previous runs
     reload_scheduled_tasks()
+
+    # Schedule daily report at 22:00 Rome time
+    _schedule_daily_report()
 
     server = HTTPServer(("0.0.0.0", port), WebhookHandler)
     print(f"\n🚀 SARAh, l'unclock intelligence — server running on port {port}")
