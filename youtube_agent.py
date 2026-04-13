@@ -8,12 +8,14 @@ SARAh è meteoropatica: il suo umore dipende dal meteo di Milano.
 
 import asyncio
 import base64
+import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
 import threading
+import time
 import traceback
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, timezone
@@ -102,6 +104,116 @@ _conversation_history = {}
 
 # Message log file
 MESSAGE_LOG = os.path.join(OUTPUT_DIR, "message_log.jsonl")
+
+# Video cache (Feature 1)
+VIDEO_CACHE_FILE = os.path.join(OUTPUT_DIR, "video_cache.json")
+VIDEO_CACHE_TTL_DAYS = 7
+
+# Transcript cache directory (Feature 6)
+TRANSCRIPT_CACHE_DIR = os.path.join(OUTPUT_DIR, "transcript_cache")
+
+# Followed channels preprocessing interval (Feature 2)
+PREPROCESS_INTERVAL_HOURS = 6
+PREPROCESS_VIDEOS_PER_CHANNEL = 3
+
+
+# ---------------------------------------------------------------------------
+# Video cache — avoids re-analyzing the same video (Feature 1)
+# ---------------------------------------------------------------------------
+
+def _load_video_cache() -> dict:
+    """Load video analysis cache from disk."""
+    try:
+        with open(VIDEO_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.loads(f.read())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_video_cache(cache: dict):
+    """Save video analysis cache to disk."""
+    os.makedirs(os.path.dirname(VIDEO_CACHE_FILE), exist_ok=True)
+    with open(VIDEO_CACHE_FILE, "w", encoding="utf-8") as f:
+        f.write(json.dumps(cache, ensure_ascii=False, indent=2))
+
+
+def _get_cached_analysis(video_id: str) -> Optional[dict]:
+    """Return cached analysis if it exists and is < VIDEO_CACHE_TTL_DAYS old."""
+    cache = _load_video_cache()
+    entry = cache.get(video_id)
+    if not entry:
+        return None
+    cached_ts = entry.get("timestamp", "")
+    try:
+        cached_dt = datetime.fromisoformat(cached_ts)
+        if (datetime.now() - cached_dt).days >= VIDEO_CACHE_TTL_DAYS:
+            print(f"  📦 Cache expired for {video_id} (older than {VIDEO_CACHE_TTL_DAYS} days)")
+            return None
+    except (ValueError, TypeError):
+        return None
+    print(f"  📦 Cache HIT for {video_id}")
+    return entry
+
+
+def _set_cached_analysis(video_id: str, analysis: str, transcript: str):
+    """Store analysis in cache."""
+    cache = _load_video_cache()
+    cache[video_id] = {
+        "analysis": analysis,
+        "timestamp": datetime.now().isoformat(),
+        "transcript_hash": hashlib.sha256(transcript.encode()).hexdigest()[:16],
+    }
+    _save_video_cache(cache)
+    print(f"  📦 Cache SAVED for {video_id}")
+
+
+# ---------------------------------------------------------------------------
+# Transcript cache — persist transcripts to disk (Feature 6)
+# ---------------------------------------------------------------------------
+
+def _save_transcript_cache(video_id: str, transcript: str):
+    """Save transcript to disk cache."""
+    os.makedirs(TRANSCRIPT_CACHE_DIR, exist_ok=True)
+    path = os.path.join(TRANSCRIPT_CACHE_DIR, f"{video_id}.txt")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(transcript)
+
+
+def _load_transcript_cache(video_id: str) -> Optional[str]:
+    """Load transcript from disk cache."""
+    path = os.path.join(TRANSCRIPT_CACHE_DIR, f"{video_id}.txt")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Followed channels (Feature 2)
+# ---------------------------------------------------------------------------
+
+def _followed_channels_path(sender: str) -> str:
+    """Return path to user's followed channels file."""
+    return os.path.join(USERS_DIR, sender, "followed_channels.json")
+
+
+def _load_followed_channels(sender: str) -> list:
+    """Load followed channels for a user."""
+    path = _followed_channels_path(sender)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.loads(f.read())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def _save_followed_channels(sender: str, channels: list):
+    """Save followed channels for a user."""
+    path = _followed_channels_path(sender)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(json.dumps(channels, ensure_ascii=False, indent=2))
 
 
 # ---------------------------------------------------------------------------
@@ -336,7 +448,12 @@ def load_user_memory(sender: str) -> dict:
             "favorite_creators": [],
             "topics_of_interest": [],
             "recent_interactions": [],  # last 20 interactions [{ts, message, intent, summary}]
-            "preferences": {},  # user-specific prefs
+            "preferences": {
+                "preferred_format": "audio",    # "audio" | "bullet" | "mindmap" | "actions"
+                "preferred_length": "medium",   # "short" | "medium" | "long"
+                "preferred_language": "it",     # "it" | "en"
+                "auto_follow": False,           # auto-follow creators after 3+ analyses
+            },
         }
 
 
@@ -587,7 +704,27 @@ AZIONI POSSIBILI:
 10. feedback — L'utente segnala un PROBLEMA o ERRORE di SARAh.
     Params: complaint (descrizione), raw_message (messaggio originale)
 
-11. not_youtube — Il messaggio NON riguarda video YouTube. Include saluti puri, domande generiche, conversazione.
+11. follow_channel — L'utente vuole seguire un canale per pre-monitoraggio automatico.
+    Params: creator (nome del creator)
+    Esempi: "segui chase", "segui enkk", "inizia a seguire cole medin"
+
+12. unfollow_channel — L'utente vuole smettere di seguire un canale.
+    Params: creator (nome del creator)
+    Esempi: "smetti di seguire chase", "non seguire più enkk", "rimuovi cole"
+
+13. list_followed — L'utente vuole vedere i canali che segue.
+    Params: raw_message (messaggio originale)
+    Esempi: "chi seguo?", "che canali seguo?", "lista canali seguiti"
+
+14. set_preferences — L'utente vuole cambiare le sue preferenze di output.
+    Params: preferred_format ("audio"/"bullet"/"mindmap"/"actions"), preferred_length ("short"/"medium"/"long"), preferred_language ("it"/"en"), auto_follow (boolean)
+    Esempi: "preferisco bullet points", "briefing corti", "analisi in inglese", "voglio le azioni", "attiva auto-follow", "dammi la mindmap"
+
+15. compare_videos — L'utente vuole confrontare video/creator su un tema.
+    Params: creators (lista nomi), topic (argomento), n (video per creator, default 3)
+    Esempi: "confronta chase e cole su agenti AI", "cosa dicono tutti su Claude?", "confronta i punti di vista su MCP"
+
+16. not_youtube — Il messaggio NON riguarda video YouTube. Include saluti puri, domande generiche, conversazione.
     Params: raw_message (messaggio originale), is_greeting (boolean — true se è un saluto/presentazione)
 
 REGOLE:
@@ -596,6 +733,12 @@ REGOLE:
 - Se l'utente vuole cancellare/eliminare un briefing programmato → cancel_schedule.
 - Se l'utente dice "cancella X e crea Y" → usa scheduling con i nuovi parametri (il handler gestirà la cancellazione).
 - Se l'utente si LAMENTA di qualcosa che SARAh ha fatto male → feedback.
+- Se l'utente dice "segui X" / "inizia a seguire X" → follow_channel.
+- Se l'utente dice "smetti di seguire X" / "non seguire più X" → unfollow_channel.
+- Se l'utente chiede "chi seguo?" / "che canali seguo?" → list_followed.
+- Se l'utente vuole cambiare formato output ("preferisco bullet", "briefing corti", "in inglese") → set_preferences.
+- Se l'utente chiede di CONFRONTARE creator/video ("confronta X e Y", "cosa dicono tutti su Z") → compare_videos.
+- Se l'utente chiede output specifico insieme alla richiesta ("dammi i bullet points su X", "azioni dal video di Y") → usa l'azione appropriata (channel_analysis, topic_search, etc.) con output_format nel params.
 - TUTTO il resto (saluti, domande non-YouTube, conversazione) → not_youtube.
 - In caso di dubbio, se c'è QUALSIASI riferimento a video/YouTube → trattalo come richiesta YouTube.
 - "topic_search" e "news_search" sono simili: usa news_search quando l'utente dice "novità"/"news"/"ultimi", topic_search per il resto.
@@ -1171,41 +1314,140 @@ IMPORTANTE: Rispondi focalizzandoti SPECIFICAMENTE su ciò che l'utente ha chies
 Produci comunque l'analisi dual-layer, ma concentrati sulla richiesta specifica."""
 
 
-def summarize_with_claude(video: VideoInfo, transcript: str, creator: str, user_focus: str = "") -> dict:
-    """Send transcript to Claude and get structured dual-layer summary.
-    If user_focus is provided, the analysis prioritizes that specific request."""
-    client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+def _chunk_transcript(transcript: str, chunk_size: int = 10000) -> list[str]:
+    """Split transcript into chunks at sentence boundaries.
+    Used for very long transcripts (Feature 4)."""
+    if len(transcript) <= chunk_size:
+        return [transcript]
 
-    max_chars = 60000
-    if len(transcript) > max_chars:
-        transcript = transcript[:max_chars] + "\n\n[...trascrizione troncata per lunghezza...]"
+    chunks = []
+    start = 0
+    while start < len(transcript):
+        end = start + chunk_size
+        if end >= len(transcript):
+            chunks.append(transcript[start:])
+            break
+        # Find sentence boundary (. ! ? followed by space)
+        boundary = -1
+        for sep in ['. ', '! ', '? ', '.\n', '!\n', '?\n']:
+            pos = transcript.rfind(sep, start, end)
+            if pos > boundary:
+                boundary = pos + len(sep)
+        if boundary <= start:
+            # No sentence boundary found, split at space
+            boundary = transcript.rfind(' ', start, end)
+            if boundary <= start:
+                boundary = end
+        chunks.append(transcript[start:boundary])
+        start = boundary
+
+    return chunks
+
+
+def _summarize_chunk(client, chunk: str, chunk_num: int, total_chunks: int,
+                     video_title: str, creator: str) -> str:
+    """Summarize a single transcript chunk (Feature 4)."""
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=2048,
+        system="""Sei un analista che riassume segmenti di trascrizioni video.
+Produci un riassunto dettagliato del segmento, catturando tutti i punti chiave, concetti e informazioni importanti.
+Rispondi in italiano. Sii completo ma conciso.""",
+        messages=[{"role": "user", "content": f"Segmento {chunk_num}/{total_chunks} della trascrizione di \"{video_title}\" di {creator}:\n\n{chunk}"}],
+    )
+    return response.content[0].text
+
+
+def summarize_with_claude(video: VideoInfo, transcript: str, creator: str, user_focus: str = "",
+                          preferred_length: str = "medium") -> dict:
+    """Send transcript to Claude and get structured dual-layer summary.
+    If user_focus is provided, the analysis prioritizes that specific request.
+    For transcripts > 30000 chars, uses smart chunking (Feature 4)."""
+    client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
 
     date_formatted = video.upload_date
     if len(date_formatted) == 8:
         date_formatted = f"{date_formatted[:4]}-{date_formatted[4:6]}-{date_formatted[6:]}"
 
+    # Feature 4: Smart chunking for very long transcripts
+    if len(transcript) > 30000:
+        print(f"  📝 Long transcript ({len(transcript)} chars), using smart chunking...")
+        chunks = _chunk_transcript(transcript, chunk_size=10000)
+        print(f"  📝 Split into {len(chunks)} chunks")
+
+        segment_summaries = []
+        total_input = 0
+        total_output = 0
+        for i, chunk in enumerate(chunks, 1):
+            print(f"  📝 Summarizing chunk {i}/{len(chunks)}...")
+            summary = _summarize_chunk(client, chunk, i, len(chunks), video.title, creator)
+            segment_summaries.append(summary)
+
+        # Synthesize all segment summaries into final analysis
+        combined_summaries = "\n\n".join(
+            f"--- SEGMENTO {i+1} ---\n{s}" for i, s in enumerate(segment_summaries)
+        )
+        synth_transcript = f"[Riassunti dei {len(chunks)} segmenti della trascrizione]\n\n{combined_summaries}"
+
+        # Adjust length instruction based on preference
+        length_instruction = ""
+        if preferred_length == "short":
+            length_instruction = "\n\nIMPORTANTE: Sii molto conciso, max 500 parole totali."
+        elif preferred_length == "long":
+            length_instruction = "\n\nIMPORTANTE: Sii molto dettagliato e approfondito."
+
+        system = SYSTEM_PROMPT + length_instruction
+
+        if user_focus:
+            user_msg = USER_PROMPT_TEMPLATE_FOCUSED.format(
+                title=video.title, creator=creator, url=video.url,
+                date=date_formatted, user_focus=user_focus, transcript=synth_transcript,
+            )
+        else:
+            user_msg = USER_PROMPT_TEMPLATE.format(
+                title=video.title, creator=creator, url=video.url,
+                date=date_formatted, transcript=synth_transcript,
+            )
+
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514", max_tokens=4096,
+            system=system, messages=[{"role": "user", "content": user_msg}],
+        )
+        return {
+            "full_text": response.content[0].text,
+            "input_tokens": response.usage.input_tokens,
+            "output_tokens": response.usage.output_tokens,
+        }
+
+    # Standard path for shorter transcripts
+    max_chars = 60000
+    if len(transcript) > max_chars:
+        transcript = transcript[:max_chars] + "\n\n[...trascrizione troncata per lunghezza...]"
+
+    # Adjust length instruction based on preference
+    length_instruction = ""
+    if preferred_length == "short":
+        length_instruction = "\n\nIMPORTANTE: Sii molto conciso, max 500 parole totali."
+    elif preferred_length == "long":
+        length_instruction = "\n\nIMPORTANTE: Sii molto dettagliato e approfondito."
+
+    system = SYSTEM_PROMPT + length_instruction
+
     if user_focus:
         user_msg = USER_PROMPT_TEMPLATE_FOCUSED.format(
-            title=video.title,
-            creator=creator,
-            url=video.url,
-            date=date_formatted,
-            user_focus=user_focus,
-            transcript=transcript,
+            title=video.title, creator=creator, url=video.url,
+            date=date_formatted, user_focus=user_focus, transcript=transcript,
         )
     else:
         user_msg = USER_PROMPT_TEMPLATE.format(
-            title=video.title,
-            creator=creator,
-            url=video.url,
-            date=date_formatted,
-            transcript=transcript,
+            title=video.title, creator=creator, url=video.url,
+            date=date_formatted, transcript=transcript,
         )
 
     response = client.messages.create(
         model="claude-sonnet-4-20250514",
         max_tokens=4096,
-        system=SYSTEM_PROMPT,
+        system=system,
         messages=[{"role": "user", "content": user_msg}],
     )
 
@@ -1217,27 +1459,120 @@ def summarize_with_claude(video: VideoInfo, transcript: str, creator: str, user_
 
 
 # ---------------------------------------------------------------------------
+# Multi-format output (Feature 5)
+# ---------------------------------------------------------------------------
+
+def format_as_bullets(analysis_text: str) -> str:
+    """Convert analysis to bullet point format using Claude."""
+    client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=2048,
+        system="""Trasforma l'analisi in una lista di bullet points chiari e concisi.
+Usa questo formato:
+- Punto principale
+  - Sotto-punto se necessario
+Mantieni i due layer (Knowledge e Business) come sezioni separate.
+Rispondi in italiano. Non usare markdown pesante, solo trattini per i bullet.""",
+        messages=[{"role": "user", "content": analysis_text}],
+    )
+    return response.content[0].text
+
+
+def format_as_mindmap(analysis_text: str) -> str:
+    """Convert analysis to indented concept hierarchy."""
+    client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=2048,
+        system="""Trasforma l'analisi in una mappa concettuale testuale con indentazione gerarchica.
+Usa questo formato:
+TEMA CENTRALE
+  ├─ Concetto 1
+  │   ├─ Dettaglio A
+  │   └─ Dettaglio B
+  ├─ Concetto 2
+  │   └─ Dettaglio C
+  └─ Concetto 3
+Mantieni sia il layer Knowledge che Business.
+Rispondi in italiano.""",
+        messages=[{"role": "user", "content": analysis_text}],
+    )
+    return response.content[0].text
+
+
+def format_as_actions(analysis_text: str) -> str:
+    """Extract only actionable items from analysis."""
+    client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=2048,
+        system="""Estrai SOLO le azioni concrete dall'analisi. Per ogni azione indica:
+[ ] Azione da fare
+    Priorita: alta/media/bassa
+    Perche: breve motivazione
+
+Concentrati su:
+- Cosa costruire/replicare per unclock
+- Cosa testare/provare
+- Cosa studiare/approfondire
+- Opportunita di mercato da cogliere
+
+Rispondi in italiano. Solo azioni concrete e fattibili, niente teoria.""",
+        messages=[{"role": "user", "content": analysis_text}],
+    )
+    return response.content[0].text
+
+
+def _apply_output_format(analysis_text: str, output_format: str) -> str:
+    """Apply the requested output format to an analysis."""
+    if output_format == "bullet":
+        return format_as_bullets(analysis_text)
+    elif output_format == "mindmap":
+        return format_as_mindmap(analysis_text)
+    elif output_format == "actions":
+        return format_as_actions(analysis_text)
+    return analysis_text  # "audio" or default — return as-is
+
+
+# ---------------------------------------------------------------------------
 # Follow-up with conversation memory
 # ---------------------------------------------------------------------------
 
 def handle_follow_up(sender: str, question: str) -> str:
-    """Answer a follow-up question based on previous analyses for this user."""
+    """Answer a follow-up question based on previous analyses for this user.
+    Enhanced (Feature 6): loads transcripts from disk cache for richer context."""
     client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
 
     history = _conversation_history.get(sender, [])
     if not history:
         return "Non ho analisi precedenti a cui fare riferimento. Mandami prima un video o un canale da analizzare!"
 
-    # Build context from recent analyses
-    context = "\n\n".join([
-        f"--- {item['title']} ---\n{item['summary']}"
-        for item in history[-5:]  # last 5 analyses
-    ])
+    # Build context from recent analyses + transcripts from cache
+    context_parts = []
+    for item in history[-5:]:
+        part = f"--- {item['title']} ---\n{item['summary']}"
+        # Try to load cached transcript for richer context
+        video_id = item.get("video_id", "")
+        if video_id:
+            cached_transcript = _load_transcript_cache(video_id)
+            if cached_transcript:
+                # Include first 5000 chars of transcript for context
+                part += f"\n\nTRASCRIZIONE (parziale):\n{cached_transcript[:5000]}"
+        context_parts.append(part)
+
+    context = "\n\n".join(context_parts)
 
     response = client.messages.create(
         model="claude-sonnet-4-20250514",
         max_tokens=2048,
-        system="""Sei un analista di unclock. Ti viene data una domanda di approfondimento e il contesto delle analisi precedenti.
+        system="""Sei un analista di unclock. Ti viene data una domanda di approfondimento e il contesto delle analisi precedenti (con trascrizioni quando disponibili).
+
+Supporti domande come:
+- "approfondisci il punto X" — fai un deep dive su quel punto specifico
+- "cosa dice esattamente su X?" — cerca nella trascrizione informazioni su quel tema
+- "riassumi in N frasi" — fai un riassunto ultra-conciso
+
 Rispondi in modo diretto e approfondito. Se la domanda riguarda un video specifico, concentrati su quello. Rispondi in italiano.""",
         messages=[{"role": "user", "content": f"CONTESTO ANALISI PRECEDENTI:\n{context}\n\nDOMANDA:\n{question}"}],
     )
@@ -1540,28 +1875,53 @@ def update_index(creator_slug: str, processed_videos: list[dict], output_dir: st
 # Core pipeline (processes a list of videos)
 # ---------------------------------------------------------------------------
 
-def process_videos(videos: list[VideoInfo], creator_name: str, sender: str = None, user_focus: str = "") -> list[dict]:
+def process_videos(videos: list[VideoInfo], creator_name: str, sender: str = None,
+                    user_focus: str = "", output_format: str = "audio") -> list[dict]:
     """Analyze a list of videos: transcript → Claude → save markdown. Returns analyses.
-    user_focus: the original user request, used to focus the analysis."""
+    user_focus: the original user request, used to focus the analysis.
+    output_format: "audio" | "bullet" | "mindmap" | "actions" (Feature 5)."""
     creator_slug = slugify(creator_name)
     processed = []
     video_analyses = []
 
+    # Load user preferences for length if sender is available
+    preferred_length = "medium"
+    if sender:
+        memory = load_user_memory(sender)
+        prefs = memory.get("preferences", {})
+        preferred_length = prefs.get("preferred_length", "medium")
+
     for i, video in enumerate(videos, 1):
         print(f"\n--- Video {i}/{len(videos)}: {video.title} ---")
 
-        print("  📝 Fetching transcript...")
-        transcript = get_transcript(video.video_id)
-        if not transcript:
-            print("  ⏭ Skipping (no transcript)")
-            continue
+        # Feature 1: Check video cache first
+        cached = _get_cached_analysis(video.video_id)
+        if cached and not user_focus:
+            print(f"  📦 Using cached analysis for {video.video_id}")
+            full_text = cached["analysis"]
+        else:
+            print("  📝 Fetching transcript...")
+            transcript = get_transcript(video.video_id)
+            if not transcript:
+                print("  ⏭ Skipping (no transcript)")
+                continue
 
-        print(f"  📝 Transcript: {len(transcript)} chars")
-        print("  🤖 Analyzing with Claude...")
-        result = summarize_with_claude(video, transcript, creator_name, user_focus=user_focus)
-        print(f"  🤖 Done ({result['input_tokens']} in / {result['output_tokens']} out tokens)")
+            print(f"  📝 Transcript: {len(transcript)} chars")
 
-        save_markdown(video, result["full_text"], creator_slug)
+            # Feature 6: Save transcript to disk cache
+            _save_transcript_cache(video.video_id, transcript)
+
+            print("  🤖 Analyzing with Claude...")
+            result = summarize_with_claude(video, transcript, creator_name,
+                                           user_focus=user_focus, preferred_length=preferred_length)
+            print(f"  🤖 Done ({result['input_tokens']} in / {result['output_tokens']} out tokens)")
+            full_text = result["full_text"]
+
+            # Feature 1: Save to cache (only generic analyses, not focused ones)
+            if not user_focus:
+                _set_cached_analysis(video.video_id, full_text, transcript)
+
+        save_markdown(video, full_text, creator_slug)
 
         date_fmt = video.upload_date
         if len(date_fmt) == 8:
@@ -1572,12 +1932,12 @@ def process_videos(videos: list[VideoInfo], creator_name: str, sender: str = Non
             "url": video.url,
             "date": date_fmt,
             "video_id": video.video_id,
-            "summary": result["full_text"],
+            "summary": full_text,
         }
         processed.append(analysis)
         video_analyses.append(analysis)
 
-        # Store in conversation memory for follow-ups
+        # Store in conversation memory for follow-ups (with transcript ref)
         if sender:
             if sender not in _conversation_history:
                 _conversation_history[sender] = []
@@ -1586,15 +1946,51 @@ def process_videos(videos: list[VideoInfo], creator_name: str, sender: str = Non
     if processed:
         update_index(creator_slug, processed)
 
+    # Feature 2: Auto-follow after 3+ analyses of same creator
+    if sender and creator_name and len(video_analyses) > 0:
+        memory = load_user_memory(sender)
+        prefs = memory.get("preferences", {})
+        if prefs.get("auto_follow", False):
+            fav = memory.get("favorite_creators", [])
+            creator_count = sum(1 for c in fav if c.lower() == creator_name.lower())
+            # Check recent interactions count for this creator
+            recent = memory.get("recent_interactions", [])
+            creator_analyses = sum(1 for r in recent if r.get("creator", "").lower() == creator_name.lower()
+                                   and r.get("intent") in ("channel_analysis", "single_video"))
+            if creator_analyses >= 3:
+                followed = _load_followed_channels(sender)
+                if not any(ch.get("name", "").lower() == creator_name.lower() for ch in followed):
+                    channel_url = resolve_creator(creator_name)
+                    if channel_url:
+                        followed.append({"name": creator_name, "url": channel_url, "added": datetime.now().isoformat()})
+                        _save_followed_channels(sender, followed)
+                        print(f"  🔔 Auto-followed {creator_name} (3+ analyses)")
+
     return video_analyses
 
 
-def generate_and_send_briefing(video_analyses: list[dict], recipient: str, label: str = "briefing"):
-    """Generate voice over and send to WhatsApp."""
+def generate_and_send_briefing(video_analyses: list[dict], recipient: str, label: str = "briefing",
+                               output_format: str = "audio"):
+    """Generate voice over and send to WhatsApp.
+    output_format (Feature 5): "audio" | "bullet" | "mindmap" | "actions"."""
     if not video_analyses:
         send_whatsapp_text(recipient, "⚠️ Nessun video trovato o nessuna trascrizione disponibile.")
         return
 
+    # Feature 5: Non-audio formats — send formatted text instead
+    if output_format in ("bullet", "mindmap", "actions"):
+        print(f"\n--- Generating {output_format} output ({len(video_analyses)} videos) ---")
+        for va in video_analyses:
+            formatted = _apply_output_format(va["summary"], output_format)
+            header = f"📹 *{va['title']}*\n🔗 {va['url']}\n\n"
+            # WhatsApp max message ~4096 chars
+            text = header + formatted
+            if len(text) > 4000:
+                text = text[:3950] + "\n\n[...testo troncato...]"
+            send_whatsapp_text(recipient, text)
+        return
+
+    # Default: audio format
     print(f"\n--- Generating voice over ({len(video_analyses)} videos) ---")
 
     if len(video_analyses) == 1:
@@ -1672,8 +2068,13 @@ def handle_channel_analysis(params: dict, sender: str):
     send_whatsapp_text(sender, f"{mood['emoji']} Ci lavoro subito! Analizzo {len(videos)} video di {creator_name}.\n\n⏱ Tempo stimato: ~{est} minuti\n\nTi mando il briefing audio appena pronto.")
 
     user_focus = params.get("_original_message", "")
-    analyses = process_videos(videos, creator_name, sender, user_focus=user_focus)
-    generate_and_send_briefing(analyses, sender, label=f"vo-{slugify(creator_name)}")
+    # Feature 5: determine output format from params or user preferences
+    output_format = params.get("output_format", "")
+    if not output_format:
+        memory = load_user_memory(sender)
+        output_format = memory.get("preferences", {}).get("preferred_format", "audio")
+    analyses = process_videos(videos, creator_name, sender, user_focus=user_focus, output_format=output_format)
+    generate_and_send_briefing(analyses, sender, label=f"vo-{slugify(creator_name)}", output_format=output_format)
     if analyses:
         _save_learned_query(params.get("_original_message", ""), "channel_analysis", params, len(analyses))
 
@@ -1699,8 +2100,12 @@ def handle_single_video(params: dict, sender: str):
     send_whatsapp_text(sender, f"{mood['emoji']} Ci lavoro subito! Analizzo: *{video.title}*\n\n⏱ Tempo stimato: ~{est} minuti")
 
     user_focus = params.get("focus", params.get("_original_message", ""))
-    analyses = process_videos([video], "video-singolo", sender, user_focus=user_focus)
-    generate_and_send_briefing(analyses, sender, label="vo-video-singolo")
+    output_format = params.get("output_format", "")
+    if not output_format:
+        memory = load_user_memory(sender)
+        output_format = memory.get("preferences", {}).get("preferred_format", "audio")
+    analyses = process_videos([video], "video-singolo", sender, user_focus=user_focus, output_format=output_format)
+    generate_and_send_briefing(analyses, sender, label="vo-video-singolo", output_format=output_format)
     if analyses:
         _save_learned_query(params.get("_original_message", ""), "single_video", params, len(analyses))
 
@@ -1748,8 +2153,12 @@ def handle_topic_search(params: dict, sender: str):
     mood = get_sarah_mood()
     send_whatsapp_text(sender, f"{mood['emoji']} Ci lavoro subito! Analizzo {len(videos)} video su \"{topic}\".\n\n⏱ Tempo stimato: ~{est} minuti\n\nTi mando il briefing audio appena pronto.")
 
-    analyses = process_videos(videos, f"search-{slugify(topic)}", sender, user_focus=original_request)
-    generate_and_send_briefing(analyses, sender, label=f"vo-search-{slugify(topic)}")
+    output_format = params.get("output_format", "")
+    if not output_format:
+        memory = load_user_memory(sender)
+        output_format = memory.get("preferences", {}).get("preferred_format", "audio")
+    analyses = process_videos(videos, f"search-{slugify(topic)}", sender, user_focus=original_request, output_format=output_format)
+    generate_and_send_briefing(analyses, sender, label=f"vo-search-{slugify(topic)}", output_format=output_format)
     if analyses:
         _save_learned_query(params.get("_original_message", ""), "topic_search", params, len(analyses))
 
@@ -1789,8 +2198,12 @@ def handle_multi_creator(params: dict, sender: str):
     send_whatsapp_text(sender, f"{mood['emoji']} Ci lavoro subito! Confronto {len(all_videos)} video di {label}.\n\n⏱ Tempo stimato: ~{est} minuti\n\nTi mando il briefing audio appena pronto.")
 
     user_focus = params.get("_original_message", "")
-    analyses = process_videos(all_videos, f"multi-{slugify(topic)}", sender, user_focus=user_focus)
-    generate_and_send_briefing(analyses, sender, label=f"vo-multi-{slugify(topic)}")
+    output_format = params.get("output_format", "")
+    if not output_format:
+        memory = load_user_memory(sender)
+        output_format = memory.get("preferences", {}).get("preferred_format", "audio")
+    analyses = process_videos(all_videos, f"multi-{slugify(topic)}", sender, user_focus=user_focus, output_format=output_format)
+    generate_and_send_briefing(analyses, sender, label=f"vo-multi-{slugify(topic)}", output_format=output_format)
     if analyses:
         _save_learned_query(params.get("_original_message", ""), "multi_creator", params, len(analyses))
 
@@ -2125,8 +2538,12 @@ def handle_news_search(params: dict, sender: str):
     mood = get_sarah_mood()
     send_whatsapp_text(sender, f"{mood['emoji']} Ci lavoro subito! Analizzo {len(videos)} novità su \"{topic}\".\n\n⏱ Tempo stimato: ~{est} minuti\n\nTi mando il briefing audio appena pronto.")
 
-    analyses = process_videos(videos, f"news-{slugify(topic)}", sender, user_focus=original_request)
-    generate_and_send_briefing(analyses, sender, label=f"vo-news-{slugify(topic)}")
+    output_format = params.get("output_format", "")
+    if not output_format:
+        memory = load_user_memory(sender)
+        output_format = memory.get("preferences", {}).get("preferred_format", "audio")
+    analyses = process_videos(videos, f"news-{slugify(topic)}", sender, user_focus=original_request, output_format=output_format)
+    generate_and_send_briefing(analyses, sender, label=f"vo-news-{slugify(topic)}", output_format=output_format)
     if analyses:
         _save_learned_query(params.get("_original_message", ""), "news_search", params, len(analyses))
 
@@ -2167,6 +2584,9 @@ Considera che SARAh può:
 - Cercare novità su un tema (news_search)
 - Approfondire analisi precedenti (follow_up)
 - Programmare briefing (scheduling)
+- Seguire/smettere di seguire canali (follow_channel, unfollow_channel)
+- Confrontare video di creator diversi (compare_videos)
+- Cambiare preferenze di output (set_preferences)
 
 CONTESTO UTENTE:
 {user_context}
@@ -2410,6 +2830,330 @@ Sii concisa (max 4-5 frasi). Non usare markdown pesante.""",
         _analyze_and_learn(last_message, last_action, f"L'utente si è lamentato: {complaint[:150]}")
 
 
+# ---------------------------------------------------------------------------
+# Feature 2: Follow/unfollow channel handlers
+# ---------------------------------------------------------------------------
+
+def handle_follow_channel(params: dict, sender: str):
+    """Follow a YouTube channel for automatic preprocessing."""
+    creator_name = params.get("creator", "")
+    if not creator_name:
+        send_whatsapp_text(sender, "❌ Non ho capito quale canale vuoi seguire. Dimmi ad esempio: _\"segui Chase\"_")
+        return
+
+    channel_url = resolve_creator(creator_name)
+    if not channel_url:
+        send_whatsapp_text(sender, f"❌ Non conosco il creator \"{creator_name}\". Prova con un nome diverso o un URL YouTube.")
+        return
+
+    followed = _load_followed_channels(sender)
+
+    # Check if already followed
+    if any(ch.get("name", "").lower() == creator_name.lower() for ch in followed):
+        send_whatsapp_text(sender, f"Stai gia seguendo {creator_name}! 📺")
+        return
+
+    followed.append({
+        "name": creator_name,
+        "url": channel_url,
+        "added": datetime.now().isoformat(),
+    })
+    _save_followed_channels(sender, followed)
+
+    send_whatsapp_text(sender,
+        f"🔔 *Fatto!* Ora segui *{creator_name}*.\n\n"
+        f"Analizzerò automaticamente i suoi ultimi video ogni {PREPROCESS_INTERVAL_HOURS} ore "
+        f"e avrai le analisi pronte quando le chiedi!\n\n"
+        f"Per vedere chi segui: _\"chi seguo?\"_")
+    print(f"  🔔 {sender} now following {creator_name}")
+
+
+def handle_unfollow_channel(params: dict, sender: str):
+    """Stop following a YouTube channel."""
+    creator_name = params.get("creator", "")
+    if not creator_name:
+        send_whatsapp_text(sender, "❌ Non ho capito quale canale vuoi smettere di seguire.")
+        return
+
+    followed = _load_followed_channels(sender)
+    new_followed = [ch for ch in followed if ch.get("name", "").lower() != creator_name.lower()]
+
+    if len(new_followed) == len(followed):
+        send_whatsapp_text(sender, f"Non stavi seguendo {creator_name}.")
+        return
+
+    _save_followed_channels(sender, new_followed)
+    send_whatsapp_text(sender, f"🔕 Fatto! Non segui piu *{creator_name}*.")
+    print(f"  🔕 {sender} unfollowed {creator_name}")
+
+
+def handle_list_followed(params: dict, sender: str):
+    """List all followed channels for this user."""
+    followed = _load_followed_channels(sender)
+
+    if not followed:
+        send_whatsapp_text(sender,
+            "📺 Non segui nessun canale al momento.\n\n"
+            "Per seguire un creator dimmi: _\"segui Chase\"_")
+        return
+
+    lines = ["📺 *Canali che segui:*\n"]
+    for i, ch in enumerate(followed, 1):
+        name = ch.get("name", "?")
+        added = ch.get("added", "")[:10]
+        lines.append(f"{i}. *{name}* (dal {added})")
+    lines.append(f"\nI video di questi canali vengono pre-analizzati ogni {PREPROCESS_INTERVAL_HOURS} ore.")
+    lines.append("\nPer smettere di seguire: _\"smetti di seguire [nome]\"_")
+    send_whatsapp_text(sender, "\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# Feature 3: User preferences handler
+# ---------------------------------------------------------------------------
+
+def handle_preferences(params: dict, sender: str):
+    """Handle user preference changes."""
+    memory = load_user_memory(sender)
+    prefs = memory.get("preferences", {
+        "preferred_format": "audio",
+        "preferred_length": "medium",
+        "preferred_language": "it",
+        "auto_follow": False,
+    })
+
+    # Extract preference changes from params
+    new_format = params.get("preferred_format", "")
+    new_length = params.get("preferred_length", "")
+    new_language = params.get("preferred_language", "")
+    auto_follow = params.get("auto_follow", None)
+
+    changes = []
+    if new_format and new_format in ("audio", "bullet", "mindmap", "actions"):
+        prefs["preferred_format"] = new_format
+        format_names = {"audio": "Audio briefing", "bullet": "Bullet points", "mindmap": "Mappa concettuale", "actions": "Azioni da fare"}
+        changes.append(f"Formato: *{format_names.get(new_format, new_format)}*")
+
+    if new_length and new_length in ("short", "medium", "long"):
+        prefs["preferred_length"] = new_length
+        length_names = {"short": "Corto", "medium": "Medio", "long": "Lungo"}
+        changes.append(f"Lunghezza: *{length_names.get(new_length, new_length)}*")
+
+    if new_language and new_language in ("it", "en"):
+        prefs["preferred_language"] = new_language
+        lang_names = {"it": "Italiano", "en": "English"}
+        changes.append(f"Lingua: *{lang_names.get(new_language, new_language)}*")
+
+    if auto_follow is not None:
+        prefs["auto_follow"] = bool(auto_follow)
+        changes.append(f"Auto-follow: *{'attivo' if auto_follow else 'disattivo'}*")
+
+    memory["preferences"] = prefs
+    save_user_memory(sender, memory)
+
+    if changes:
+        send_whatsapp_text(sender,
+            f"⚙️ *Preferenze aggiornate!*\n\n" +
+            "\n".join(f"  {c}" for c in changes) +
+            "\n\nLe prossime analisi useranno queste impostazioni.")
+    else:
+        # Show current preferences
+        format_names = {"audio": "Audio briefing", "bullet": "Bullet points", "mindmap": "Mappa concettuale", "actions": "Azioni da fare"}
+        length_names = {"short": "Corto", "medium": "Medio", "long": "Lungo"}
+        lang_names = {"it": "Italiano", "en": "English"}
+        send_whatsapp_text(sender,
+            f"⚙️ *Le tue preferenze attuali:*\n\n"
+            f"  Formato: *{format_names.get(prefs.get('preferred_format', 'audio'), 'audio')}*\n"
+            f"  Lunghezza: *{length_names.get(prefs.get('preferred_length', 'medium'), 'medio')}*\n"
+            f"  Lingua: *{lang_names.get(prefs.get('preferred_language', 'it'), 'italiano')}*\n"
+            f"  Auto-follow: *{'attivo' if prefs.get('auto_follow') else 'disattivo'}*\n\n"
+            f"Per cambiare: _\"preferisco bullet points\"_, _\"briefing corti\"_, _\"analisi in inglese\"_")
+
+
+# ---------------------------------------------------------------------------
+# Feature 7: Cross-video comparison handler
+# ---------------------------------------------------------------------------
+
+def handle_comparison(params: dict, sender: str):
+    """Compare analyses from multiple creators/videos on the same topic."""
+    creators = params.get("creators", [])
+    topic = params.get("topic", "")
+    n = params.get("n", 3)
+
+    if not creators and not topic:
+        send_whatsapp_text(sender, "❌ Non ho capito cosa confrontare. Dimmi ad esempio: _\"confronta Chase e Cole su agenti AI\"_")
+        return
+
+    print(f"\n📡 Comparison: creators={creators}, topic=\"{topic}\", n={n}")
+
+    # Collect analyses
+    all_analyses = []
+    mood = get_sarah_mood()
+
+    if creators and len(creators) >= 2:
+        send_whatsapp_text(sender,
+            f"{mood['emoji']} Ci lavoro! Confronto cosa dicono {', '.join(creators)} su \"{topic or 'i loro ultimi video'}\".\n\n"
+            f"⏱ Potrebbe volerci qualche minuto...")
+
+        for creator_name in creators:
+            channel_url = resolve_creator(creator_name)
+            if not channel_url:
+                print(f"  ⚠ Creator sconosciuto: {creator_name}")
+                continue
+
+            videos = get_channel_videos(channel_url, max_videos=30)
+            if topic:
+                videos = filter_videos_by_topic(videos, topic.split())
+            videos = videos[:n]
+
+            if videos:
+                analyses = process_videos(videos, creator_name, sender)
+                for a in analyses:
+                    a["creator"] = creator_name
+                all_analyses.extend(analyses)
+
+    elif topic:
+        # Search for topic across multiple sources
+        send_whatsapp_text(sender,
+            f"{mood['emoji']} Ci lavoro! Cerco cosa dicono diversi creator su \"{topic}\".\n\n"
+            f"⏱ Potrebbe volerci qualche minuto...")
+
+        videos = search_youtube(topic, max_results=n * 2, period="month")
+        if videos:
+            analyses = process_videos(videos, f"confronto-{slugify(topic)}", sender)
+            all_analyses.extend(analyses)
+
+    if len(all_analyses) < 2:
+        send_whatsapp_text(sender, f"⚠️ Non ho trovato abbastanza contenuti per un confronto su \"{topic}\".")
+        return
+
+    # Generate comparative analysis with Claude
+    client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+    analyses_text = ""
+    for a in all_analyses:
+        creator_label = a.get("creator", "")
+        analyses_text += f"\n--- {a['title']} (di {creator_label}) ---\n{a['summary']}\n"
+
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=4096,
+        system="""Sei un analista strategico di unclock. Il tuo compito è confrontare analisi di video di creator diversi sullo stesso tema.
+
+Produci un'analisi comparativa strutturata:
+
+## TEMI COMUNI
+Cosa dicono tutti (o quasi) i creator su questo tema. Cerca i pattern ricorrenti.
+
+## PROSPETTIVE DIVERSE
+Dove i creator non sono d'accordo o hanno approcci diversi. Spiega le differenze.
+
+## INSIGHT UNICI
+Per ogni creator, qual è il contributo unico che porta — qualcosa che solo lui/lei ha detto.
+
+## SINTESI PER UNCLOCK
+Cosa significa tutto questo per unclock? Quali azioni emergono dal confronto?
+
+Rispondi in italiano. Sii concreto e diretto.""",
+        messages=[{"role": "user", "content": f"TEMA: {topic or 'confronto generale'}\n\nANALISI DA CONFRONTARE:\n{analyses_text}"}],
+    )
+
+    comparison = response.content[0].text
+
+    # Send comparison as text
+    header = f"⚔️ *CONFRONTO: {topic or 'Analisi comparativa'}*\n"
+    if creators:
+        header += f"Creator: {', '.join(creators)}\n"
+    header += f"Video analizzati: {len(all_analyses)}\n\n"
+    text = header + comparison
+    if len(text) > 4000:
+        # Split into multiple messages
+        send_whatsapp_text(sender, text[:4000])
+        if len(text) > 4000:
+            send_whatsapp_text(sender, text[4000:8000])
+    else:
+        send_whatsapp_text(sender, text)
+
+    # Optional audio briefing
+    output_format = params.get("output_format", "")
+    if not output_format:
+        memory = load_user_memory(sender)
+        output_format = memory.get("preferences", {}).get("preferred_format", "audio")
+    if output_format == "audio":
+        voice_script = generate_voice_script(single={
+            "title": f"Confronto: {topic}",
+            "url": "",
+            "summary": comparison,
+        })
+        if voice_script:
+            audio_path = str(Path(OUTPUT_DIR) / f"vo-confronto-{slugify(topic or 'general')}.ogg")
+            if generate_audio(voice_script, audio_path):
+                send_whatsapp_audio(sender, audio_path)
+
+
+# ---------------------------------------------------------------------------
+# Feature 2: Background preprocessing thread
+# ---------------------------------------------------------------------------
+
+def _preprocess_followed_channels():
+    """Background thread: pre-fetches and analyzes videos from followed channels."""
+    while True:
+        try:
+            print(f"\n🔄 Preprocessing followed channels...")
+            users_dir = Path(USERS_DIR)
+            if not users_dir.exists():
+                print("  No users directory yet, skipping...")
+                time.sleep(PREPROCESS_INTERVAL_HOURS * 3600)
+                continue
+
+            processed_count = 0
+            for user_dir in users_dir.iterdir():
+                if not user_dir.is_dir():
+                    continue
+                sender = user_dir.name
+                followed = _load_followed_channels(sender)
+                if not followed:
+                    continue
+
+                for ch in followed:
+                    channel_name = ch.get("name", "")
+                    channel_url = ch.get("url", "")
+                    if not channel_url:
+                        channel_url = resolve_creator(channel_name)
+                    if not channel_url:
+                        continue
+
+                    print(f"  🔄 Preprocessing {channel_name} for {sender}...")
+                    try:
+                        videos = get_channel_videos(channel_url, max_videos=PREPROCESS_VIDEOS_PER_CHANNEL)
+                        for video in videos:
+                            # Only process if not already cached
+                            if _get_cached_analysis(video.video_id):
+                                print(f"    📦 Already cached: {video.video_id}")
+                                continue
+
+                            transcript = get_transcript(video.video_id)
+                            if not transcript:
+                                continue
+
+                            _save_transcript_cache(video.video_id, transcript)
+
+                            result = summarize_with_claude(video, transcript, channel_name)
+                            _set_cached_analysis(video.video_id, result["full_text"], transcript)
+                            processed_count += 1
+                            print(f"    ✓ Pre-analyzed: {video.title}")
+                    except Exception as e:
+                        print(f"    ⚠ Error preprocessing {channel_name}: {e}")
+                        continue
+
+            print(f"  🔄 Preprocessing complete: {processed_count} new analyses cached")
+
+        except Exception as e:
+            print(f"  ❌ Preprocessing error: {e}")
+            traceback.print_exc()
+
+        # Sleep until next run
+        time.sleep(PREPROCESS_INTERVAL_HOURS * 3600)
+
+
 # Action routing
 ACTION_HANDLERS = {
     "channel_analysis": handle_channel_analysis,
@@ -2423,6 +3167,11 @@ ACTION_HANDLERS = {
     "news_search": handle_news_search,
     "feedback": handle_feedback,
     "not_youtube": handle_not_youtube,
+    "follow_channel": handle_follow_channel,
+    "unfollow_channel": handle_unfollow_channel,
+    "list_followed": handle_list_followed,
+    "set_preferences": handle_preferences,
+    "compare_videos": handle_comparison,
 }
 
 
@@ -2627,6 +3376,33 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self.wfile.write(report.encode())
             return
 
+        if path == "/cache":
+            # Feature 1: Return video cache entries
+            qs = parse_qs(parsed.query)
+            cache = _load_video_cache()
+            # Optional: filter by video_id
+            video_id = qs.get("video_id", [None])[0]
+            if video_id:
+                entry = cache.get(video_id)
+                result = {video_id: entry} if entry else {}
+            else:
+                # Return summary (no full analysis text to save bandwidth)
+                result = {}
+                for vid_id, entry in cache.items():
+                    result[vid_id] = {
+                        "timestamp": entry.get("timestamp", ""),
+                        "transcript_hash": entry.get("transcript_hash", ""),
+                        "analysis_length": len(entry.get("analysis", "")),
+                    }
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "total_cached": len(cache),
+                "entries": result,
+            }, ensure_ascii=False, indent=2).encode())
+            return
+
         if path == "/stats":
             # Return full learning stats summary
             errors = _load_learned_errors()
@@ -2646,9 +3422,20 @@ class WebhookHandler(BaseHTTPRequestHandler):
             except FileNotFoundError:
                 pass
 
+            # Feature 1: Cache stats
+            video_cache = _load_video_cache()
+            cache_stats = {
+                "total_cached_videos": len(video_cache),
+                "cache_ttl_days": VIDEO_CACHE_TTL_DAYS,
+            }
+
+            # Transcript cache stats
+            transcript_cache_dir = Path(TRANSCRIPT_CACHE_DIR)
+            transcript_count = len(list(transcript_cache_dir.glob("*.txt"))) if transcript_cache_dir.exists() else 0
+
             stats = {
                 "service": "SARAh, l'unclock intelligence",
-                "version": "2026-04-06-v6 (youtube-first-router + behavior-learning)",
+                "version": "2026-04-13-v7 (cache + follow + preferences + comparison)",
                 "users": user_count,
                 "total_messages": msg_count,
                 "learning": {
@@ -2658,6 +3445,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
                     "learned_creators": len(learned_creators),
                     "default_creators": len(_DEFAULT_CREATORS),
                 },
+                "cache": cache_stats,
+                "transcript_cache": {"cached_transcripts": transcript_count},
                 "recent_errors": errors[-5:] if errors else [],
                 "behavior_rules": [b["rule"] for b in behaviors] if behaviors else [],
             }
@@ -2907,9 +3696,14 @@ def start_server(port: int = None):
     # Schedule daily report at 22:00 Rome time
     _schedule_daily_report()
 
+    # Feature 2: Start background preprocessing thread for followed channels
+    preprocess_thread = threading.Thread(target=_preprocess_followed_channels, daemon=True)
+    preprocess_thread.start()
+    print(f"  🔄 Background preprocessing started (every {PREPROCESS_INTERVAL_HOURS}h)")
+
     server = HTTPServer(("0.0.0.0", port), WebhookHandler)
     print(f"\n🚀 SARAh, l'unclock intelligence — server running on port {port}")
-    print(f"   Version: 2026-04-06-v6 (youtube-first-router)")
+    print(f"   Version: 2026-04-13-v7 (cache + follow + preferences + comparison)")
     print(f"   Webhook URL: http://localhost:{port}/webhook")
     print(f"   Health check: http://localhost:{port}/health")
     print(f"\n   Waiting for WhatsApp messages...\n")
