@@ -113,7 +113,7 @@ VIDEO_CACHE_TTL_DAYS = 7
 TRANSCRIPT_CACHE_DIR = os.path.join(OUTPUT_DIR, "transcript_cache")
 
 # Followed channels preprocessing interval (Feature 2)
-PREPROCESS_INTERVAL_HOURS = 6
+PREPROCESS_INTERVAL_HOURS = 48
 PREPROCESS_VIDEOS_PER_CHANNEL = 3
 
 
