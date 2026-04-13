@@ -2914,12 +2914,13 @@ def handle_list_followed(params: dict, sender: str):
 def handle_preferences(params: dict, sender: str):
     """Handle user preference changes."""
     memory = load_user_memory(sender)
-    prefs = memory.get("preferences", {
+    default_prefs = {
         "preferred_format": "audio",
         "preferred_length": "medium",
         "preferred_language": "it",
         "auto_follow": False,
-    })
+    }
+    prefs = {**default_prefs, **memory.get("preferences", {})}
 
     # Extract preference changes from params
     new_format = params.get("preferred_format", "")
