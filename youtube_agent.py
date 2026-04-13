@@ -2067,7 +2067,11 @@ def handle_channel_analysis(params: dict, sender: str):
     mood = get_sarah_mood()
     send_whatsapp_text(sender, f"{mood['emoji']} Ci lavoro subito! Analizzo {len(videos)} video di {creator_name}.\n\n⏱ Tempo stimato: ~{est} minuti\n\nTi mando il briefing audio appena pronto.")
 
-    user_focus = params.get("_original_message", "")
+    # user_focus = specific focus/topic from the user, NOT the raw message
+    # If user just asked "analizza chase" there's no focus; if "analizza chase su AI" there is
+    user_focus = params.get("focus", "")
+    if not user_focus and keywords:
+        user_focus = " ".join(keywords)
     # Feature 5: determine output format from params or user preferences
     output_format = params.get("output_format", "")
     if not output_format:
@@ -2099,7 +2103,7 @@ def handle_single_video(params: dict, sender: str):
     mood = get_sarah_mood()
     send_whatsapp_text(sender, f"{mood['emoji']} Ci lavoro subito! Analizzo: *{video.title}*\n\n⏱ Tempo stimato: ~{est} minuti")
 
-    user_focus = params.get("focus", params.get("_original_message", ""))
+    user_focus = params.get("focus", "")
     output_format = params.get("output_format", "")
     if not output_format:
         memory = load_user_memory(sender)
@@ -2157,7 +2161,7 @@ def handle_topic_search(params: dict, sender: str):
     if not output_format:
         memory = load_user_memory(sender)
         output_format = memory.get("preferences", {}).get("preferred_format", "audio")
-    analyses = process_videos(videos, f"search-{slugify(topic)}", sender, user_focus=original_request, output_format=output_format)
+    analyses = process_videos(videos, f"search-{slugify(topic)}", sender, user_focus=topic, output_format=output_format)
     generate_and_send_briefing(analyses, sender, label=f"vo-search-{slugify(topic)}", output_format=output_format)
     if analyses:
         _save_learned_query(params.get("_original_message", ""), "topic_search", params, len(analyses))
@@ -2197,7 +2201,7 @@ def handle_multi_creator(params: dict, sender: str):
     mood = get_sarah_mood()
     send_whatsapp_text(sender, f"{mood['emoji']} Ci lavoro subito! Confronto {len(all_videos)} video di {label}.\n\n⏱ Tempo stimato: ~{est} minuti\n\nTi mando il briefing audio appena pronto.")
 
-    user_focus = params.get("_original_message", "")
+    user_focus = params.get("focus", topic or "")
     output_format = params.get("output_format", "")
     if not output_format:
         memory = load_user_memory(sender)
@@ -2542,7 +2546,7 @@ def handle_news_search(params: dict, sender: str):
     if not output_format:
         memory = load_user_memory(sender)
         output_format = memory.get("preferences", {}).get("preferred_format", "audio")
-    analyses = process_videos(videos, f"news-{slugify(topic)}", sender, user_focus=original_request, output_format=output_format)
+    analyses = process_videos(videos, f"news-{slugify(topic)}", sender, user_focus=topic, output_format=output_format)
     generate_and_send_briefing(analyses, sender, label=f"vo-news-{slugify(topic)}", output_format=output_format)
     if analyses:
         _save_learned_query(params.get("_original_message", ""), "news_search", params, len(analyses))
