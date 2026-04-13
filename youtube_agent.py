@@ -2264,7 +2264,11 @@ def _execute_scheduled_task(task: dict):
                 return
             label = slugify(creator_name)
             send_whatsapp_text(sender, f"⏰ *Task programmato in esecuzione!*\nAnalizzo {len(videos)} video di {creator_name}...")
-            process_videos(videos, label=label, creator=creator_name, sender=sender)
+            # Load user preferred output format
+            memory = load_user_memory(sender)
+            output_format = memory.get("preferences", {}).get("preferred_format", "audio")
+            analyses = process_videos(videos, creator_name, sender=sender, output_format=output_format)
+            generate_and_send_briefing(analyses, sender, label=f"vo-{label}", output_format=output_format)
 
         elif task_type == "topic" and topic:
             # Topic search
@@ -2276,7 +2280,10 @@ def _execute_scheduled_task(task: dict):
                 return
             label = f"news-{slugify(topic)}"
             send_whatsapp_text(sender, f"⏰ *Task programmato in esecuzione!*\nAnalizzo {len(videos)} video su \"{topic}\"...")
-            process_videos(videos, label=label, creator=label, sender=sender)
+            memory = load_user_memory(sender)
+            output_format = memory.get("preferences", {}).get("preferred_format", "audio")
+            analyses = process_videos(videos, label, sender=sender, user_focus=topic, output_format=output_format)
+            generate_and_send_briefing(analyses, sender, label=f"vo-{label}", output_format=output_format)
 
         else:
             send_whatsapp_text(sender, f"⚠️ Task programmato {task_id}: configurazione non valida")
