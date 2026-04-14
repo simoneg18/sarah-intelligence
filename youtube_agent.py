@@ -2072,10 +2072,8 @@ def handle_channel_analysis(params: dict, sender: str):
     if not user_focus and keywords:
         user_focus = " ".join(keywords)
     # Feature 5: determine output format from params or user preferences
-    output_format = params.get("output_format", "")
-    if not output_format:
-        memory = load_user_memory(sender)
-        output_format = memory.get("preferences", {}).get("preferred_format", "audio")
+    # Output format: only use explicit request from current message, default to audio
+    output_format = params.get("output_format", "") or "audio"
     analyses = process_videos(videos, creator_name, sender, user_focus=user_focus, output_format=output_format)
     generate_and_send_briefing(analyses, sender, label=f"vo-{slugify(creator_name)}", output_format=output_format)
     if analyses:
@@ -2103,10 +2101,8 @@ def handle_single_video(params: dict, sender: str):
     send_whatsapp_text(sender, f"{mood['emoji']} Ci lavoro subito! Analizzo: *{video.title}*\n\n⏱ Tempo stimato: ~{est} minuti")
 
     user_focus = params.get("focus", "")
-    output_format = params.get("output_format", "")
-    if not output_format:
-        memory = load_user_memory(sender)
-        output_format = memory.get("preferences", {}).get("preferred_format", "audio")
+    # Output format: only use explicit request from current message, default to audio
+    output_format = params.get("output_format", "") or "audio"
     analyses = process_videos([video], "video-singolo", sender, user_focus=user_focus, output_format=output_format)
     generate_and_send_briefing(analyses, sender, label="vo-video-singolo", output_format=output_format)
     if analyses:
@@ -2156,10 +2152,8 @@ def handle_topic_search(params: dict, sender: str):
     mood = get_sarah_mood()
     send_whatsapp_text(sender, f"{mood['emoji']} Ci lavoro subito! Analizzo {len(videos)} video su \"{topic}\".\n\n⏱ Tempo stimato: ~{est} minuti\n\nTi mando il briefing audio appena pronto.")
 
-    output_format = params.get("output_format", "")
-    if not output_format:
-        memory = load_user_memory(sender)
-        output_format = memory.get("preferences", {}).get("preferred_format", "audio")
+    # Output format: only use explicit request from current message, default to audio
+    output_format = params.get("output_format", "") or "audio"
     analyses = process_videos(videos, f"search-{slugify(topic)}", sender, user_focus=topic, output_format=output_format)
     generate_and_send_briefing(analyses, sender, label=f"vo-search-{slugify(topic)}", output_format=output_format)
     if analyses:
@@ -2201,10 +2195,8 @@ def handle_multi_creator(params: dict, sender: str):
     send_whatsapp_text(sender, f"{mood['emoji']} Ci lavoro subito! Confronto {len(all_videos)} video di {label}.\n\n⏱ Tempo stimato: ~{est} minuti\n\nTi mando il briefing audio appena pronto.")
 
     user_focus = params.get("focus", topic or "")
-    output_format = params.get("output_format", "")
-    if not output_format:
-        memory = load_user_memory(sender)
-        output_format = memory.get("preferences", {}).get("preferred_format", "audio")
+    # Output format: only use explicit request from current message, default to audio
+    output_format = params.get("output_format", "") or "audio"
     analyses = process_videos(all_videos, f"multi-{slugify(topic)}", sender, user_focus=user_focus, output_format=output_format)
     generate_and_send_briefing(analyses, sender, label=f"vo-multi-{slugify(topic)}", output_format=output_format)
     if analyses:
@@ -2263,9 +2255,8 @@ def _execute_scheduled_task(task: dict):
                 return
             label = slugify(creator_name)
             send_whatsapp_text(sender, f"⏰ *Task programmato in esecuzione!*\nAnalizzo {len(videos)} video di {creator_name}...")
-            # Load user preferred output format
-            memory = load_user_memory(sender)
-            output_format = memory.get("preferences", {}).get("preferred_format", "audio")
+            # Scheduled tasks always send audio (no explicit format override)
+            output_format = task.get("output_format", "audio")
             analyses = process_videos(videos, creator_name, sender=sender, output_format=output_format)
             generate_and_send_briefing(analyses, sender, label=f"vo-{label}", output_format=output_format)
 
@@ -2279,8 +2270,8 @@ def _execute_scheduled_task(task: dict):
                 return
             label = f"news-{slugify(topic)}"
             send_whatsapp_text(sender, f"⏰ *Task programmato in esecuzione!*\nAnalizzo {len(videos)} video su \"{topic}\"...")
-            memory = load_user_memory(sender)
-            output_format = memory.get("preferences", {}).get("preferred_format", "audio")
+            # Scheduled tasks always send audio (no explicit format override)
+            output_format = task.get("output_format", "audio")
             analyses = process_videos(videos, label, sender=sender, user_focus=topic, output_format=output_format)
             generate_and_send_briefing(analyses, sender, label=f"vo-{label}", output_format=output_format)
 
@@ -2548,10 +2539,8 @@ def handle_news_search(params: dict, sender: str):
     mood = get_sarah_mood()
     send_whatsapp_text(sender, f"{mood['emoji']} Ci lavoro subito! Analizzo {len(videos)} novità su \"{topic}\".\n\n⏱ Tempo stimato: ~{est} minuti\n\nTi mando il briefing audio appena pronto.")
 
-    output_format = params.get("output_format", "")
-    if not output_format:
-        memory = load_user_memory(sender)
-        output_format = memory.get("preferences", {}).get("preferred_format", "audio")
+    # Output format: only use explicit request from current message, default to audio
+    output_format = params.get("output_format", "") or "audio"
     analyses = process_videos(videos, f"news-{slugify(topic)}", sender, user_focus=topic, output_format=output_format)
     generate_and_send_briefing(analyses, sender, label=f"vo-news-{slugify(topic)}", output_format=output_format)
     if analyses:
@@ -3084,10 +3073,8 @@ Rispondi in italiano. Sii concreto e diretto.""",
         send_whatsapp_text(sender, text)
 
     # Optional audio briefing
-    output_format = params.get("output_format", "")
-    if not output_format:
-        memory = load_user_memory(sender)
-        output_format = memory.get("preferences", {}).get("preferred_format", "audio")
+    # Output format: only use explicit request from current message, default to audio
+    output_format = params.get("output_format", "") or "audio"
     if output_format == "audio":
         voice_script = generate_voice_script(single={
             "title": f"Confronto: {topic}",
