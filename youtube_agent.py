@@ -3416,6 +3416,30 @@ class WebhookHandler(BaseHTTPRequestHandler):
             }, ensure_ascii=False, indent=2).encode())
             return
 
+        if path == "/route-debug":
+            # Debug: run router on a message and return the decision without executing anything
+            # Usage: GET /route-debug?message=analizzami+chase+per+unclock
+            qs = parse_qs(parsed.query)
+            message = qs.get("message", [""])[0]
+            if not message:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"error": "missing message query param"}')
+                return
+            try:
+                decision = route_message(message, sender=None)
+            except Exception as e:
+                decision = {"error": str(e)}
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "message": message,
+                "decision": decision,
+            }, ensure_ascii=False, indent=2).encode())
+            return
+
         if path == "/responses":
             # Return full response log — every interaction with SARAh's actual responses
             qs = parse_qs(parsed.query)
