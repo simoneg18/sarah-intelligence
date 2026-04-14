@@ -744,6 +744,7 @@ REGOLE:
 - "topic_search" e "news_search" sono simili: usa news_search quando l'utente dice "novità"/"news"/"ultimi", topic_search per il resto.
 - DOMANDE IPOTETICHE: Se l'utente CHIEDE se SARAh è in grado di fare qualcosa ("sapresti...", "potresti...", "sei in grado di...", "e se ti chiedessi...", "lo sapresti fare?", "riesci a...") → NON eseguire l'azione. Classifica come not_youtube con is_greeting=false e is_capability_question=true.
 - CONTESTO CONVERSAZIONALE: Se il messaggio è corto e ambiguo ("di chi?", "quale?", "sì quello"), usa il contesto delle interazioni recenti per capire a cosa si riferisce. Se si riferisce a qualcosa legato a YouTube/scheduling/task, classifica di conseguenza — NON come not_youtube.
+- ANALISI BUSINESS UNCLOCK: Di default il riassunto è SOLO sul contenuto del video. Se l'utente chiede ESPLICITAMENTE l'analisi business (es: "per unclock", "cosa possiamo farci", "lato business", "implicazioni per unclock", "come lo replichiamo", "come lo vendiamo", "in ottica business", "analisi business") → aggiungi nel params il campo "include_business": true. Altrimenti NON aggiungere questo campo o mettilo a false.
 
 Rispondi ESCLUSIVAMENTE con JSON valido:
 {"action": "nome_azione", "params": {...}, "confidence": 0.0-1.0}"""
@@ -1268,20 +1269,43 @@ def period_to_dateafter(period: str) -> Optional[str]:
 # Claude summarization
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """Sei un analista strategico per unclock, una startup italiana early-stage che costruisce agenti AI su misura per freelance e PMI usando n8n + Claude come stack tecnologico.
+SYSTEM_PROMPT_SUMMARY = """Sei un analista che riassume video YouTube in modo chiaro, completo e concreto.
+
+Il tuo obiettivo: far capire a fondo il video a chi ascolta, come se avesse guardato il video stesso — ma meglio strutturato.
+
+Struttura del riassunto:
+- **Cos'è e di cosa parla**: il cuore del video in 2-3 frasi
+- **Come funziona / Come si fa**: la spiegazione dettagliata del concetto/tool/tecnica principale. Segui il ragionamento del creator passo per passo.
+- **Concetti chiave**: i 3-5 punti fondamentali spiegati con chiarezza
+- **Esempi concreti**: riporta sempre esempi pratici.
+  - Se il creator fa esempi nel video, RIPORTALI tali e quali (numeri, nomi, tool specifici)
+  - Se il video è astratto e non ne fa, AGGIUNGI TU 1-2 esempi concreti dal mondo reale che aiutano a capire il concetto, specificando che sono tuoi esempi (es: "Per capirci meglio, pensa a...")
+- **Perché è rilevante adesso**: contesto di mercato/timing, cosa sta cambiando
+- **Per approfondire**: cosa cercare/studiare se si vuole andare oltre
+
+Regole:
+- Scrivi per qualcuno che vuole capire a fondo, non per un principiante assoluto ma nemmeno per un esperto
+- Rispondi SEMPRE in italiano
+- Concretezza prima di tutto: numeri, nomi di tool, scenari specifici
+- Zero fuffa, zero "è interessante notare che..."
+- Se il creator cita stats, link, risorse — riportali"""
+
+SYSTEM_PROMPT_DUAL = """Sei un analista strategico per unclock, una startup italiana early-stage che costruisce agenti AI su misura per freelance e PMI usando n8n + Claude come stack tecnologico.
 
 unclock vende tempo liberato, non tecnologia. I target sono: freelance marketing/PM, head hunter freelance, PMI italiane. Il modello parte da €1.500/anno per i freelance.
 
 Quando analizzi un video, produci DUE layer di analisi:
 
-## LAYER 1 — KNOWLEDGE (per imparare)
-Spiega in modo chiaro e pratico cosa viene trattato nel video. Scrivi per qualcuno che vuole capire a fondo la tecnologia/concetto, non per un principiante assoluto ma nemmeno per un esperto.
+## LAYER 1 — RIASSUNTO (per capire il video)
+Il cuore dell'analisi. Un riassunto completo e concreto del video.
 
 Struttura:
-- **Cos'è e come funziona**: spiegazione chiara del concetto/tool/tecnica principale
-- **Concetti chiave**: i 3-5 punti fondamentali spiegati
+- **Cos'è e di cosa parla**: il cuore del video in 2-3 frasi
+- **Come funziona / Come si fa**: la spiegazione dettagliata passo per passo
+- **Concetti chiave**: i 3-5 punti fondamentali
+- **Esempi concreti**: riporta gli esempi del creator (se ci sono) oppure aggiungi tu 1-2 esempi reali (specificando che sono tuoi)
 - **Perché è rilevante adesso**: contesto di mercato/timing
-- **Approfondimenti**: se qualcuno volesse andare più a fondo, cosa dovrebbe cercare/studiare
+- **Per approfondire**: cosa cercare/studiare
 
 ## LAYER 2 — BUSINESS (per unclock)
 Analizza il contenuto dal punto di vista di unclock: cosa possiamo costruire, vendere, replicare.
@@ -1295,12 +1319,15 @@ Struttura:
 
 Rispondi SEMPRE in italiano. Sii concreto, diretto, zero fuffa."""
 
+# Legacy alias for backward compat
+SYSTEM_PROMPT = SYSTEM_PROMPT_DUAL
+
 USER_PROMPT_TEMPLATE = """Analizza questa trascrizione del video "{title}" di {creator} ({url}, pubblicato il {date}).
 
 TRASCRIZIONE:
 {transcript}
 
-Produci l'analisi dual-layer come da istruzioni."""
+Produci l'analisi come da istruzioni."""
 
 USER_PROMPT_TEMPLATE_FOCUSED = """Analizza questa trascrizione del video "{title}" di {creator} ({url}, pubblicato il {date}).
 
@@ -1311,7 +1338,7 @@ TRASCRIZIONE:
 {transcript}
 
 IMPORTANTE: Rispondi focalizzandoti SPECIFICAMENTE su ciò che l'utente ha chiesto. La richiesta dell'utente ha la priorità.
-Produci comunque l'analisi dual-layer, ma concentrati sulla richiesta specifica."""
+Produci comunque l'analisi completa, ma concentrati sulla richiesta specifica."""
 
 
 def _chunk_transcript(transcript: str, chunk_size: int = 10000) -> list[str]:
@@ -1359,8 +1386,9 @@ Rispondi in italiano. Sii completo ma conciso.""",
 
 
 def summarize_with_claude(video: VideoInfo, transcript: str, creator: str, user_focus: str = "",
-                          preferred_length: str = "medium") -> dict:
-    """Send transcript to Claude and get structured dual-layer summary.
+                          preferred_length: str = "medium", include_business: bool = False) -> dict:
+    """Send transcript to Claude and get structured summary.
+    include_business: if True, produces dual-layer (summary + business). Default: summary only.
     If user_focus is provided, the analysis prioritizes that specific request.
     For transcripts > 30000 chars, uses smart chunking (Feature 4)."""
     client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
@@ -1396,7 +1424,8 @@ def summarize_with_claude(video: VideoInfo, transcript: str, creator: str, user_
         elif preferred_length == "long":
             length_instruction = "\n\nIMPORTANTE: Sii molto dettagliato e approfondito."
 
-        system = SYSTEM_PROMPT + length_instruction
+        base_prompt = SYSTEM_PROMPT_DUAL if include_business else SYSTEM_PROMPT_SUMMARY
+        system = base_prompt + length_instruction
 
         if user_focus:
             user_msg = USER_PROMPT_TEMPLATE_FOCUSED.format(
@@ -1431,7 +1460,8 @@ def summarize_with_claude(video: VideoInfo, transcript: str, creator: str, user_
     elif preferred_length == "long":
         length_instruction = "\n\nIMPORTANTE: Sii molto dettagliato e approfondito."
 
-    system = SYSTEM_PROMPT + length_instruction
+    base_prompt = SYSTEM_PROMPT_DUAL if include_business else SYSTEM_PROMPT_SUMMARY
+    system = base_prompt + length_instruction
 
     if user_focus:
         user_msg = USER_PROMPT_TEMPLATE_FOCUSED.format(
@@ -1584,15 +1614,33 @@ Rispondi in modo diretto e approfondito. Se la domanda riguarda un video specifi
 # Combined Voice Over
 # ---------------------------------------------------------------------------
 
-VOICE_SYSTEM_PROMPT = """Sei un collega di Simone e Fede, i founder di unclock. Stai registrando un audio che ascolteranno mentre fanno altro — cucinare, camminare, guidare.
+VOICE_SYSTEM_PROMPT_SUMMARY = """Sei un amico esperto che racconta a Simone e Fede il contenuto di un video che hanno chiesto di riassumere. Lo ascolteranno mentre fanno altro — cucinare, camminare, guidare.
 
-Il tuo compito: prendere le analisi di più video e trasformarle in UN UNICO audio fluido e naturale.
+Il tuo compito: prendere l'analisi del video e trasformarla in un audio fluido e naturale che faccia capire A FONDO il contenuto.
+
+Regole fondamentali:
+- Tono conversazionale, come una telefonata tra amici. Dai del tu.
+- Frasi corte. Niente subordinate lunghe. Pause naturali.
+- Per ogni video: PERCHÉ è rilevante, DI COSA parla (il cuore del contenuto), COME FUNZIONA (spiegazione dettagliata), ESEMPI CONCRETI (quelli del creator se ce ne sono, altrimenti aggiungine 1-2 tuoi specificando "per capirci, pensa a...")
+- Transizioni naturali tra un video e l'altro
+- Chiudi con le 2-3 IDEE PIÙ IMPORTANTI da portarsi a casa dal video
+- NON usare markdown, bullet point, asterischi, numeri di lista o formattazione — è testo PURO da leggere ad alta voce
+- Niente emoji
+- Delimita lo script tra <!-- VOICE_START --> e <!-- VOICE_END -->
+- Lunghezza: circa 200-250 parole PER VIDEO analizzato
+- NON fare analisi business unclock a meno che l'utente l'abbia chiesto esplicitamente. Concentrati sul FAR CAPIRE il video.
+
+Rispondi in italiano."""
+
+VOICE_SYSTEM_PROMPT_DUAL = """Sei un collega di Simone e Fede, i founder di unclock. Stai registrando un audio che ascolteranno mentre fanno altro — cucinare, camminare, guidare.
+
+Il tuo compito: prendere le analisi dei video e trasformarle in UN UNICO audio fluido e naturale che copra sia il contenuto che le implicazioni business per unclock.
 
 Regole fondamentali:
 - Tono conversazionale, come una telefonata tra colleghi. Dai del tu.
 - Frasi corte. Niente subordinate lunghe. Pause naturali.
-- Per ogni video: spiega prima PERCHÉ è rilevante, poi COSA dice, poi COSA POSSIAMO FARCI NOI come unclock
-- Transizioni naturali tra un video e l'altro ("Passiamo al secondo video..." / "L'altro contenuto interessante è...")
+- Per ogni video: PERCHÉ è rilevante, COSA dice (con esempi concreti), COME FUNZIONA, COSA POSSIAMO FARCI NOI come unclock (cosa replicare, come, a chi venderlo)
+- Transizioni naturali tra un video e l'altro
 - Chiudi con un recap delle 2-3 azioni più importanti da fare subito
 - NON usare markdown, bullet point, asterischi, numeri di lista o formattazione — è testo PURO da leggere ad alta voce
 - Niente emoji
@@ -1601,6 +1649,9 @@ Regole fondamentali:
 - IMPORTANTE: Chiudi SEMPRE con una sezione "TREND E SEGNALI" dove identifichi pattern ricorrenti che emergono da PIÙ video. Un trend è valido solo se confermato da almeno 2 video diversi. Spiega perché quel trend è rilevante per unclock e cosa dovreste fare al riguardo.
 
 Rispondi in italiano."""
+
+# Legacy alias
+VOICE_SYSTEM_PROMPT = VOICE_SYSTEM_PROMPT_DUAL
 
 VOICE_USER_TEMPLATE = """Ecco le analisi di {n_videos} video. Genera UN UNICO script audio che copra tutti i video, sia il layer knowledge che business per ciascuno.
 
@@ -1628,8 +1679,9 @@ Genera lo script voice over."""
 
 
 def generate_voice_script(video_analyses: list[dict] = None, single: dict = None,
-                          followup: dict = None) -> Optional[str]:
-    """Generate a voice over script. Supports multi-video, single video, and follow-up."""
+                          followup: dict = None, include_business: bool = False) -> Optional[str]:
+    """Generate a voice over script. Supports multi-video, single video, and follow-up.
+    include_business: if True, uses dual prompt (summary + business). Default: summary only."""
     client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
 
     if followup:
@@ -1649,10 +1701,11 @@ def generate_voice_script(video_analyses: list[dict] = None, single: dict = None
     else:
         return None
 
+    voice_system = VOICE_SYSTEM_PROMPT_DUAL if include_business else VOICE_SYSTEM_PROMPT_SUMMARY
     response = client.messages.create(
         model="claude-sonnet-4-20250514",
         max_tokens=4096,
-        system=VOICE_SYSTEM_PROMPT,
+        system=voice_system,
         messages=[{"role": "user", "content": user_msg}],
     )
 
@@ -1876,10 +1929,12 @@ def update_index(creator_slug: str, processed_videos: list[dict], output_dir: st
 # ---------------------------------------------------------------------------
 
 def process_videos(videos: list[VideoInfo], creator_name: str, sender: str = None,
-                    user_focus: str = "", output_format: str = "audio") -> list[dict]:
+                    user_focus: str = "", output_format: str = "audio",
+                    include_business: bool = False) -> list[dict]:
     """Analyze a list of videos: transcript → Claude → save markdown. Returns analyses.
     user_focus: the original user request, used to focus the analysis.
-    output_format: "audio" | "bullet" | "mindmap" | "actions" (Feature 5)."""
+    output_format: "audio" | "bullet" | "mindmap" | "actions" (Feature 5).
+    include_business: if True, add unclock business layer to analysis."""
     creator_slug = slugify(creator_name)
     processed = []
     video_analyses = []
@@ -1911,14 +1966,15 @@ def process_videos(videos: list[VideoInfo], creator_name: str, sender: str = Non
             # Feature 6: Save transcript to disk cache
             _save_transcript_cache(video.video_id, transcript)
 
-            print("  🤖 Analyzing with Claude...")
+            print(f"  🤖 Analyzing with Claude (business layer: {include_business})...")
             result = summarize_with_claude(video, transcript, creator_name,
-                                           user_focus=user_focus, preferred_length=preferred_length)
+                                           user_focus=user_focus, preferred_length=preferred_length,
+                                           include_business=include_business)
             print(f"  🤖 Done ({result['input_tokens']} in / {result['output_tokens']} out tokens)")
             full_text = result["full_text"]
 
-            # Feature 1: Save to cache (only generic analyses, not focused ones)
-            if not user_focus:
+            # Feature 1: Save to cache (only generic summary analyses, not focused or business)
+            if not user_focus and not include_business:
                 _set_cached_analysis(video.video_id, full_text, transcript)
 
         save_markdown(video, full_text, creator_slug)
@@ -1970,9 +2026,10 @@ def process_videos(videos: list[VideoInfo], creator_name: str, sender: str = Non
 
 
 def generate_and_send_briefing(video_analyses: list[dict], recipient: str, label: str = "briefing",
-                               output_format: str = "audio"):
+                               output_format: str = "audio", include_business: bool = False):
     """Generate voice over and send to WhatsApp.
-    output_format (Feature 5): "audio" | "bullet" | "mindmap" | "actions"."""
+    output_format (Feature 5): "audio" | "bullet" | "mindmap" | "actions".
+    include_business: if True, voice script includes unclock business layer."""
     if not video_analyses:
         send_whatsapp_text(recipient, "⚠️ Nessun video trovato o nessuna trascrizione disponibile.")
         return
@@ -1990,16 +2047,16 @@ def generate_and_send_briefing(video_analyses: list[dict], recipient: str, label
             send_whatsapp_text(recipient, text)
 
     # ALWAYS generate audio — it's the core feature
-    print(f"\n--- Generating voice over ({len(video_analyses)} videos) ---")
+    print(f"\n--- Generating voice over ({len(video_analyses)} videos, business: {include_business}) ---")
 
     if len(video_analyses) == 1:
         voice_script = generate_voice_script(single={
             "title": video_analyses[0]["title"],
             "url": video_analyses[0]["url"],
             "summary": video_analyses[0]["summary"],
-        })
+        }, include_business=include_business)
     else:
-        voice_script = generate_voice_script(video_analyses=video_analyses)
+        voice_script = generate_voice_script(video_analyses=video_analyses, include_business=include_business)
 
     if voice_script:
         audio_path = str(Path(OUTPUT_DIR) / f"{label}.ogg")
@@ -2074,8 +2131,9 @@ def handle_channel_analysis(params: dict, sender: str):
     # Feature 5: determine output format from params or user preferences
     # Output format: only use explicit request from current message, default to audio
     output_format = params.get("output_format", "") or "audio"
-    analyses = process_videos(videos, creator_name, sender, user_focus=user_focus, output_format=output_format)
-    generate_and_send_briefing(analyses, sender, label=f"vo-{slugify(creator_name)}", output_format=output_format)
+    include_business = params.get("include_business", False)
+    analyses = process_videos(videos, creator_name, sender, user_focus=user_focus, output_format=output_format, include_business=include_business)
+    generate_and_send_briefing(analyses, sender, label=f"vo-{slugify(creator_name)}", output_format=output_format, include_business=include_business)
     if analyses:
         _save_learned_query(params.get("_original_message", ""), "channel_analysis", params, len(analyses))
 
@@ -2103,8 +2161,9 @@ def handle_single_video(params: dict, sender: str):
     user_focus = params.get("focus", "")
     # Output format: only use explicit request from current message, default to audio
     output_format = params.get("output_format", "") or "audio"
-    analyses = process_videos([video], "video-singolo", sender, user_focus=user_focus, output_format=output_format)
-    generate_and_send_briefing(analyses, sender, label="vo-video-singolo", output_format=output_format)
+    include_business = params.get("include_business", False)
+    analyses = process_videos([video], "video-singolo", sender, user_focus=user_focus, output_format=output_format, include_business=include_business)
+    generate_and_send_briefing(analyses, sender, label="vo-video-singolo", output_format=output_format, include_business=include_business)
     if analyses:
         _save_learned_query(params.get("_original_message", ""), "single_video", params, len(analyses))
 
@@ -2154,8 +2213,9 @@ def handle_topic_search(params: dict, sender: str):
 
     # Output format: only use explicit request from current message, default to audio
     output_format = params.get("output_format", "") or "audio"
-    analyses = process_videos(videos, f"search-{slugify(topic)}", sender, user_focus=topic, output_format=output_format)
-    generate_and_send_briefing(analyses, sender, label=f"vo-search-{slugify(topic)}", output_format=output_format)
+    include_business = params.get("include_business", False)
+    analyses = process_videos(videos, f"search-{slugify(topic)}", sender, user_focus=topic, output_format=output_format, include_business=include_business)
+    generate_and_send_briefing(analyses, sender, label=f"vo-search-{slugify(topic)}", output_format=output_format, include_business=include_business)
     if analyses:
         _save_learned_query(params.get("_original_message", ""), "topic_search", params, len(analyses))
 
@@ -2197,8 +2257,9 @@ def handle_multi_creator(params: dict, sender: str):
     user_focus = params.get("focus", topic or "")
     # Output format: only use explicit request from current message, default to audio
     output_format = params.get("output_format", "") or "audio"
-    analyses = process_videos(all_videos, f"multi-{slugify(topic)}", sender, user_focus=user_focus, output_format=output_format)
-    generate_and_send_briefing(analyses, sender, label=f"vo-multi-{slugify(topic)}", output_format=output_format)
+    include_business = params.get("include_business", False)
+    analyses = process_videos(all_videos, f"multi-{slugify(topic)}", sender, user_focus=user_focus, output_format=output_format, include_business=include_business)
+    generate_and_send_briefing(analyses, sender, label=f"vo-multi-{slugify(topic)}", output_format=output_format, include_business=include_business)
     if analyses:
         _save_learned_query(params.get("_original_message", ""), "multi_creator", params, len(analyses))
 
@@ -2257,8 +2318,9 @@ def _execute_scheduled_task(task: dict):
             send_whatsapp_text(sender, f"⏰ *Task programmato in esecuzione!*\nAnalizzo {len(videos)} video di {creator_name}...")
             # Scheduled tasks always send audio (no explicit format override)
             output_format = task.get("output_format", "audio")
-            analyses = process_videos(videos, creator_name, sender=sender, output_format=output_format)
-            generate_and_send_briefing(analyses, sender, label=f"vo-{label}", output_format=output_format)
+            include_business = task.get("include_business", False)
+            analyses = process_videos(videos, creator_name, sender=sender, output_format=output_format, include_business=include_business)
+            generate_and_send_briefing(analyses, sender, label=f"vo-{label}", output_format=output_format, include_business=include_business)
 
         elif task_type == "topic" and topic:
             # Topic search
@@ -2272,8 +2334,9 @@ def _execute_scheduled_task(task: dict):
             send_whatsapp_text(sender, f"⏰ *Task programmato in esecuzione!*\nAnalizzo {len(videos)} video su \"{topic}\"...")
             # Scheduled tasks always send audio (no explicit format override)
             output_format = task.get("output_format", "audio")
-            analyses = process_videos(videos, label, sender=sender, user_focus=topic, output_format=output_format)
-            generate_and_send_briefing(analyses, sender, label=f"vo-{label}", output_format=output_format)
+            include_business = task.get("include_business", False)
+            analyses = process_videos(videos, label, sender=sender, user_focus=topic, output_format=output_format, include_business=include_business)
+            generate_and_send_briefing(analyses, sender, label=f"vo-{label}", output_format=output_format, include_business=include_business)
 
         else:
             send_whatsapp_text(sender, f"⚠️ Task programmato {task_id}: configurazione non valida")
@@ -2541,8 +2604,9 @@ def handle_news_search(params: dict, sender: str):
 
     # Output format: only use explicit request from current message, default to audio
     output_format = params.get("output_format", "") or "audio"
-    analyses = process_videos(videos, f"news-{slugify(topic)}", sender, user_focus=topic, output_format=output_format)
-    generate_and_send_briefing(analyses, sender, label=f"vo-news-{slugify(topic)}", output_format=output_format)
+    include_business = params.get("include_business", False)
+    analyses = process_videos(videos, f"news-{slugify(topic)}", sender, user_focus=topic, output_format=output_format, include_business=include_business)
+    generate_and_send_briefing(analyses, sender, label=f"vo-news-{slugify(topic)}", output_format=output_format, include_business=include_business)
     if analyses:
         _save_learned_query(params.get("_original_message", ""), "news_search", params, len(analyses))
 
@@ -3075,12 +3139,13 @@ Rispondi in italiano. Sii concreto e diretto.""",
     # Optional audio briefing
     # Output format: only use explicit request from current message, default to audio
     output_format = params.get("output_format", "") or "audio"
+    include_business = params.get("include_business", False)
     if output_format == "audio":
         voice_script = generate_voice_script(single={
             "title": f"Confronto: {topic}",
             "url": "",
             "summary": comparison,
-        })
+        }, include_business=include_business)
         if voice_script:
             audio_path = str(Path(OUTPUT_DIR) / f"vo-confronto-{slugify(topic or 'general')}.ogg")
             if generate_audio(voice_script, audio_path):
