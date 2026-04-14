@@ -1977,9 +1977,9 @@ def generate_and_send_briefing(video_analyses: list[dict], recipient: str, label
         send_whatsapp_text(recipient, "⚠️ Nessun video trovato o nessuna trascrizione disponibile.")
         return
 
-    # Feature 5: Non-audio formats — send formatted text instead
+    # Feature 5: Non-audio formats — send formatted text IN ADDITION to audio
     if output_format in ("bullet", "mindmap", "actions"):
-        print(f"\n--- Generating {output_format} output ({len(video_analyses)} videos) ---")
+        print(f"\n--- Generating {output_format} text output ({len(video_analyses)} videos) ---")
         for va in video_analyses:
             formatted = _apply_output_format(va["summary"], output_format)
             header = f"📹 *{va['title']}*\n🔗 {va['url']}\n\n"
@@ -1988,9 +1988,8 @@ def generate_and_send_briefing(video_analyses: list[dict], recipient: str, label
             if len(text) > 4000:
                 text = text[:3950] + "\n\n[...testo troncato...]"
             send_whatsapp_text(recipient, text)
-        return
 
-    # Default: audio format
+    # ALWAYS generate audio — it's the core feature
     print(f"\n--- Generating voice over ({len(video_analyses)} videos) ---")
 
     if len(video_analyses) == 1:
@@ -2008,7 +2007,7 @@ def generate_and_send_briefing(video_analyses: list[dict], recipient: str, label
         if generate_audio(voice_script, audio_path):
             send_full_briefing(recipient, video_analyses, audio_path)
         else:
-            # Fallback: send text summary
+            # Fallback: send text summary if audio fails
             send_whatsapp_text(recipient, "⚠️ Audio generation failed. Ecco il testo:\n\n" + voice_script[:4000])
     else:
         send_whatsapp_text(recipient, "⚠️ Voice script generation failed.")
